@@ -14,7 +14,8 @@ from spacy.matcher import PhraseMatcher
 
 
 # ========= Config & chemins =========
-st.set_page_config(page_title="Salomon NER Chatbot", layout="wide")
+# Pas de layout="wide"
+st.set_page_config(page_title="Salomon NER Chatbot")
 ROOT = Path(__file__).parent
 DATA_PATH = ROOT / "data" / "models.json"
 RESP_PATH = ROOT / "data" / "responses.json"
@@ -42,7 +43,7 @@ class NERPipeline:
     Pipeline NER simplifié :
     - Exact : spaCy PhraseMatcher (tous les alias de models.json)
     - Fuzzy : RapidFuzz (WRatio) sur un lexique d’alias (score normalisé 0..1)
-    - Fenêtre n-gram interne FIXÉE à 5 (non exposée dans l’UI)
+    - Fenêtre d’analyse interne : 1 à 5 tokens (fixe)
     """
 
     def __init__(self, data_path: Path, fuzzy_threshold: int = 88) -> None:
@@ -61,7 +62,7 @@ class NERPipeline:
         except Exception:
             self.has_rapidfuzz = False
 
-        # Réglages fuzzy (pilotés par presets / UI)
+        # Réglages fuzzy (pilotés par l’UI)
         self.fuzzy_preset: str = "balanced" if self.has_rapidfuzz else "off"
         self.fuzzy_threshold: int = fuzzy_threshold
         self.enable_fuzzy: bool = bool(self.has_rapidfuzz)
@@ -119,7 +120,7 @@ class NERPipeline:
         require_kw_or_digit: bool,
         keyword_regex_str: str,
     ) -> None:
-        """Options avancées (sans n-gram côté UI)."""
+        """Options avancées (sans contrôle de fenêtre)."""
         self.enable_fuzzy = bool(enable_fuzzy and self.has_rapidfuzz)
         self.min_fuzzy_span_len = int(min_span_len)
         self.require_keyword_or_digit = bool(require_kw_or_digit)
@@ -211,14 +212,14 @@ class NERPipeline:
         return sorted(matches, key=lambda m: (m.start, -m.end))
 
     def _fuzzy_spans(self, doc) -> List[EntityMatch]:
-        """Fenêtre n-gram FIXÉE à 5 (non exposée). Score = WRatio/100."""
+        """Fenêtre d’analyse 1..5 tokens. Score = WRatio/100."""
         from rapidfuzz import process, fuzz  # type: ignore
 
         out: List[EntityMatch] = []
         tokens = list(doc)
         re_kw = re.compile(self.keyword_regex_str, re.I) if self.keyword_regex_str else None
 
-        MAX_NGRAM = 5  # fixé
+        MAX_NGRAM = 5
 
         for i in range(len(tokens)):
             for n in range(1, MAX_NGRAM + 1):
@@ -388,7 +389,7 @@ def load_responses_config() -> dict:
 
 
 def detect_intent(text: str, cfg: dict) -> Optional[str]:
-    """Retourne l'intention détectée (nom) ou None si pas trouvée (PhraseMatcher + petits fallbacks)."""
+    """Retourne l'intention détectée (nom) ou None si pas trouvée (PhraseMatcher + fallbacks)."""
     low = (text or "").lower()
 
     # spaCy PhraseMatcher (mots-clés)
@@ -572,93 +573,106 @@ st.sidebar.header("Paramètres")
 # RapidFuzz dispo ?
 rf_installed = getattr(pipeline, "has_rapidfuzz", False)
 
-# Presets
-preset_labels = {"off": "Désactivé", "balanced": "Équilibré", "aggressive": "Agressif (fautes)"}
+# Widgets avec clés stables, sans st.rerun pour éviter les boucles
+preset_labels = {"off": "Désactivé", "balanced": "Équilibré", "aggressive": "Agressif"}
 label_to_key = {v: k for k, v in preset_labels.items()}
-cur_preset_key = getattr(pipeline, "fuzzy_preset", "balanced")
-if not rf_installed:
-    cur_preset_key = "off"
 
-old_preset = cur_preset_key
-preset_choice = st.sidebar.radio(
+if "ui_preset" not in st.session_state:
+    st.session_state.ui_preset = pipeline.fuzzy_preset if rf_installed else "off"
+if "ui_threshold" not in st.session_state:
+    st.session_state.ui_threshold = pipeline.fuzzy_threshold
+if "ui_enable_fuzzy" not in st.session_state:
+    st.session_state.ui_enable_fuzzy = bool(pipeline.enable_fuzzy and rf_installed)
+if "ui_min_len" not in st.session_state:
+    st.session_state.ui_min_len = pipeline.min_fuzzy_span_len
+if "ui_require_kw" not in st.session_state:
+    st.session_state.ui_require_kw = pipeline.require_keyword_or_digit
+if "ui_kw_regex" not in st.session_state:
+    st.session_state.ui_kw_regex = pipeline.keyword_regex_str
+
+preset_choice_label = st.sidebar.radio(
     "Tolérance aux fautes",
     options=list(preset_labels.values()),
-    index=[*preset_labels].index(cur_preset_key),
-    help="Profils: Désactivé (aucun fuzzy) · Équilibré (WRatio≥88) · Agressif (WRatio≥82).",
+    index=[*preset_labels].index(preset_labels.get(st.session_state.ui_preset, "Équilibré")),
+    help="Off: aucune approximation. Équilibré: WRatio ≥ 88. Agressif: WRatio ≥ 82.",
+    key="preset_radio",
 )
-pipeline.set_fuzzy_preset(label_to_key[preset_choice])
-if label_to_key[preset_choice] != old_preset:
-    st.rerun()
+st.session_state.ui_preset = label_to_key[preset_choice_label]
 
-# Seuil fuzzy (override manuel après preset)
-threshold = st.sidebar.slider(
+st.session_state.ui_threshold = st.sidebar.slider(
     "Seuil fuzzy (WRatio)",
     min_value=70,
     max_value=100,
-    value=pipeline.fuzzy_threshold,
+    value=st.session_state.ui_threshold,
     step=1,
-    help="Plus le seuil est haut, moins il y a de faux positifs. Par défaut: 88 (équilibré) / 82 (agressif).",
+    help="Plus le seuil est haut, moins il y a de correspondances approximatives.",
+    key="threshold_slider",
 )
-if threshold != pipeline.fuzzy_threshold:
-    pipeline.set_threshold(threshold)
-    st.rerun()
 
-# Options avancées (sans n-gram)
-with st.sidebar.expander("Options avancées (fuzzy)", expanded=False):
-    old_enable = bool(getattr(pipeline, "enable_fuzzy", False))
-    enable_fuzzy_ui = st.checkbox(
+with st.sidebar.expander("Options avancées", expanded=False):
+    st.session_state.ui_enable_fuzzy = st.checkbox(
         "Activer le fuzzy matching",
-        value=(getattr(pipeline, "enable_fuzzy", False) and rf_installed),
+        value=st.session_state.ui_enable_fuzzy,
         disabled=not rf_installed,
         help="Active/désactive l’appariement approximatif (RapidFuzz).",
+        key="enable_fuzzy_cb",
     )
-    min_len_ui = st.slider(
+    st.session_state.ui_min_len = st.slider(
         "Longueur minimale d'un span (sans espaces)",
         min_value=3,
         max_value=20,
-        value=getattr(pipeline, "min_fuzzy_span_len", 5),
+        value=st.session_state.ui_min_len,
         step=1,
         help="Ignore les spans trop courts.",
+        key="min_len_slider",
     )
-    require_ui = st.checkbox(
+    st.session_state.ui_require_kw = st.checkbox(
         "Exiger mot-clé ou chiffre",
-        value=getattr(pipeline, "require_keyword_or_digit", True),
-        help="Réduit les faux positifs (exige un chiffre ou un mot-clé: ultra, speed, pro, …).",
+        value=st.session_state.ui_require_kw,
+        help="Réduit les faux positifs (exige un chiffre ou un mot-clé: ultra, speed, pro…).",
+        key="require_kw_cb",
     )
-    kw_regex_ui = st.text_input(
+    st.session_state.ui_kw_regex = st.text_input(
         "Regex mots-clés",
-        value=getattr(
-            pipeline,
-            "keyword_regex_str",
-            r"(speed|cross|ultra|sense|ride|xa|pro|x\s?ultra|supercross|speedcross|super|x\s?pro)",
-        ),
-        help="Définit les tokens ‘marque/modèle’ requis quand l’option est activée.",
+        value=st.session_state.ui_kw_regex,
+        help="Tokens requis quand l’option est activée.",
+        key="kw_regex_input",
     )
 
-    pipeline.set_fuzzy_options(
-        enable_fuzzy=enable_fuzzy_ui,
-        min_span_len=min_len_ui,
-        require_kw_or_digit=require_ui,
-        keyword_regex_str=kw_regex_ui,
-    )
+# Appliquer l’UI au pipeline (ordre: preset -> overrides)
+pipeline.set_fuzzy_preset(st.session_state.ui_preset)
+pipeline.set_threshold(st.session_state.ui_threshold)
+pipeline.set_fuzzy_options(
+    enable_fuzzy=st.session_state.ui_enable_fuzzy,
+    min_span_len=st.session_state.ui_min_len,
+    require_kw_or_digit=st.session_state.ui_require_kw,
+    keyword_regex_str=st.session_state.ui_kw_regex,
+)
 
-    if enable_fuzzy_ui != old_enable:
-        st.rerun()
+# Info simple demandée
+st.sidebar.caption("Fenêtre d’analyse fixe : 1 à 5 tokens.")
 
-# Info simple : sur combien de mots l'analyse se fait (fixe)
-st.sidebar.caption("🔎 Fenêtre d’analyse : **1 à 5 tokens** (non modifiable).")
+# RapidFuzz info
+if not rf_installed:
+    st.sidebar.warning("RapidFuzz n'est pas installé. Le fuzzy matching est indisponible.")
+
+# Bouton reload
+if st.sidebar.button("Recharger les entités (models.json)"):
+    pipeline.reload()
+    st.sidebar.info("Règles rechargées depuis models.json")
+
 
 # ========= MAIN =========
 st.title("Chatbot NER – Modèles Salomon")
-st.caption("Démonstrateur pédagogique : NER par règles + fuzzy matching (simplifié)")
+st.caption("Reconnaissance de modèles par règles + fuzzy matching (simplifié)")
 
-col_left, col_right = st.columns([2, 1])  # ← important : pas de variable tronquée !
+col_left, col_right = st.columns([2, 1])
 
 with col_left:
-    if st.button(" Vider la conversation"):
+    if st.button("Vider la conversation"):
         st.session_state.messages = []
         st.session_state["context_canos"] = []
-        st.rerun()
+        st.experimental_rerun()
 
     # Historique
     for msg in st.session_state.messages:
@@ -690,7 +704,7 @@ with col_left:
             html_text = highlight_html(prompt, ents)
             st.markdown(html_text, unsafe_allow_html=True)
 
-        # Réponse assistant (déterministe)
+        # Réponse assistant (déterministe minimaliste)
         fallback_canos = st.session_state.get("context_canos", [])
         reply = assistant_reply(prompt, ents, fallback_canos=fallback_canos)
 
@@ -708,6 +722,6 @@ with col_right:
             rows = [m.to_dict() for m in last_user["entities"]]
             st.dataframe(rows, use_container_width=True)
         else:
-            st.info("Saisis un message pour voir les entités reconnues.")
+            st.info("Saisissez un message pour voir les entités reconnues.")
     else:
         st.info("Pas encore de messages.")
