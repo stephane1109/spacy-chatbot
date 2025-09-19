@@ -20,7 +20,7 @@ DATA_PATH = ROOT / "data" / "models.json"
 RESP_PATH = ROOT / "data" / "responses.json"
 
 
-# ========= NER intégré (plus de package externe) =========
+# ========= NER intégré =========
 @dataclass
 class EntityMatch:
     text: str
@@ -38,12 +38,17 @@ class EntityMatch:
 
 
 class NERPipeline:
-    """PhraseMatcher (exact) + RapidFuzz (fuzzy). Fenêtre n-gram interne fixée à 5 (non exposée dans l'UI)."""
+    """
+    Pipeline NER simplifié :
+    - Exact : spaCy PhraseMatcher (tous les alias de models.json)
+    - Fuzzy : RapidFuzz (WRatio) sur un lexique d’alias (score normalisé 0..1)
+    - Fenêtre n-gram interne fixée à 5 (non exposée dans l’UI)
+    """
 
     def __init__(self, data_path: Path, fuzzy_threshold: int = 88) -> None:
         self.data_path = data_path
 
-        # spaCy: FR si dispo, sinon pipeline "blank"
+        # spaCy : modèle FR si dispo, sinon "blank"
         try:
             self.nlp = spacy.load("fr_core_news_sm", disable=["parser", "ner", "lemmatizer", "tagger"])
         except Exception:
@@ -56,11 +61,11 @@ class NERPipeline:
         except Exception:
             self.has_rapidfuzz = False
 
-        # Réglages fuzzy (seront pilotés par presets / UI)
+        # Réglages fuzzy (pilotés par presets / UI)
         self.fuzzy_preset: str = "balanced" if self.has_rapidfuzz else "off"
         self.fuzzy_threshold: int = fuzzy_threshold
         self.enable_fuzzy: bool = bool(self.has_rapidfuzz)
-        self.min_fuzzy_span_len: int = 5           # longueur min sans espaces
+        self.min_fuzzy_span_len: int = 5            # longueur min sans espaces
         self.require_keyword_or_digit: bool = True  # garde-fou
         self.keyword_regex_str: str = r"(speed|cross|ultra|sense|ride|xa|pro|x\s?ultra|supercross|speedcross|super|x\s?pro)"
 
@@ -75,15 +80,14 @@ class NERPipeline:
         self._pm: Optional[PhraseMatcher] = None
 
         self.reload()
-        # Applique le preset par défaut
         self.set_fuzzy_preset(self.fuzzy_preset)
 
     # ----- Presets (Off / Balanced / Aggressive) -----
     def set_fuzzy_preset(self, key: str) -> None:
-        """3 modes explicites.
-        - off:        enable=False, seuil 100 (inutile), min_len=5
-        - balanced:   enable=True,  seuil=88,  min_len=5
-        - aggressive: enable=True,  seuil=82,  min_len=4
+        """Modes et valeurs :
+        - off        -> enable=False, seuil=100, min_len=5
+        - balanced   -> enable=True,  seuil=88,  min_len=5
+        - aggressive -> enable=True,  seuil=82,  min_len=4
         """
         if not self.has_rapidfuzz:
             self.enable_fuzzy = False
@@ -214,7 +218,7 @@ class NERPipeline:
         tokens = list(doc)
         re_kw = re.compile(self.keyword_regex_str, re.I) if self.keyword_regex_str else None
 
-        MAX_NGRAM = 5  # fixé (nous avons supprimé l'option d'UI)
+        MAX_NGRAM = 5  # fixé
 
         for i in range(len(tokens)):
             for n in range(1, MAX_NGRAM + 1):
@@ -305,15 +309,6 @@ def highlight_html(text: str, matches: List[EntityMatch]) -> str:
     return "".join(out)
 
 
-def assistant_reply_from_entities(matches: List[EntityMatch]) -> str:
-    if not matches:
-        return "Je n'ai pas encore reconnu de modèle Salomon. Pouvez-vous préciser le nom du modèle ?"
-    canos = list(dict((m.canonical, None) for m in matches).keys())
-    if len(canos) == 1:
-        return f"Je comprends que vous cherchez des informations sur le modèle : {canos[0]}"
-    return "Je comprends que vous cherchez des informations sur les modèles : " + ", ".join(canos)
-
-
 # ========= Helpers (avant l’UI !) =========
 def load_models_index() -> dict:
     """Index {canonical: {category, label, url}} depuis models.json."""
@@ -335,7 +330,7 @@ def load_models_index() -> dict:
 
 
 def load_responses_config() -> dict:
-    """Charge responses.json ou retourne une config par défaut (texte + URL possibles)."""
+    """Charge responses.json ou retourne une config par défaut (texte + URL)."""
     default = {
         "intents": [
             {"name": "advantages", "keywords": ["avantage", "points forts", "bénéf", "pourquoi", "atout"]},
@@ -355,26 +350,9 @@ def load_responses_config() -> dict:
                     "Salomon X Ultra 4": {"text": "X Ultra 4: stabilité en rando, accroche sur terrain technique, confort durable.", "url": "https://www.salomon.com/fr-fr/shop-emea/product/x-ultra-4.html"},
                 },
             },
-            "price": {
-                "generic": {"text": "Je n’ai pas le prix exact. Je peux vous rediriger vers la fiche produit officielle.", "url": None},
-                "by_category": {},
-                "by_model": {},
-            },
-            "waterproof": {
-                "generic": {"text": "Selon la déclinaison GTX, le modèle peut être imperméable (membrane Gore-Tex).", "url": None},
-                "by_category": {
-                    "trail": {"text": "En trail, privilégiez les versions GTX si vous cherchez l’imperméabilité.", "url": None},
-                },
-                "by_model": {},
-            },
-            "terrain": {
-                "generic": {"text": "Précisez votre terrain (boue, rocaille, sentier, route) pour une recommandation plus fine.", "url": None},
-                "by_category": {
-                    "trail": {"text": "Adapté aux sentiers, selon le modèle: boue (crampons agressifs) ou terrain mixte.", "url": None},
-                    "hiking": {"text": "Pensé pour la randonnée sur sentiers, chemins et terrains vallonnés.", "url": None},
-                },
-                "by_model": {},
-            },
+            "price": {"generic": {"text": "Je n’ai pas le prix exact. Consultez la fiche produit.", "url": None}},
+            "waterproof": {"generic": {"text": "Version GTX = imperméable (membrane).", "url": None}},
+            "terrain": {"generic": {"text": "Précisez le terrain (boue, rocaille, sentier, route)…", "url": None}},
         },
     }
 
@@ -410,7 +388,7 @@ def load_responses_config() -> dict:
 
 
 def detect_intent(text: str, cfg: dict) -> Optional[str]:
-    """Retourne l'intention détectée (nom) ou None si pas trouvée."""
+    """Retourne l'intention détectée (nom) ou None si pas trouvée (PhraseMatcher + petits fallbacks)."""
     low = (text or "").lower()
 
     # spaCy PhraseMatcher (mots-clés)
@@ -609,8 +587,6 @@ preset_choice = st.sidebar.radio(
     help="Profils: Désactivé (aucun fuzzy) · Équilibré (WRatio≥88) · Agressif (WRatio≥82).",
 )
 pipeline.set_fuzzy_preset(label_to_key[preset_choice])
-
-# Si le preset a changé, on redémarre l'UI pour appliquer partout
 if label_to_key[preset_choice] != old_preset:
     st.rerun()
 
@@ -666,24 +642,10 @@ with st.sidebar.expander("Options avancées (fuzzy)", expanded=False):
         keyword_regex_str=kw_regex_ui,
     )
 
-    # Re-run immédiat si on change l'état on/off
     if enable_fuzzy_ui != old_enable:
         st.rerun()
 
-# État
-if not rf_installed:
-    st.sidebar.warning("RapidFuzz n'est pas installé; la tolérance aux fautes est indisponible. Exécute `pip install -r requirements.txt` dans ton venv.")
-elif getattr(pipeline, "enable_fuzzy", False):
-    st.sidebar.caption(f"Fuzzy actif – Profil: {preset_choice} · Seuil: {pipeline.fuzzy_threshold}")
-else:
-    st.sidebar.info("Fuzzy désactivé.")
-
-# Bouton reload
-if st.sidebar.button("Recharger le JSON et les règles"):
-    pipeline.reload()
-    st.sidebar.success("Règles rechargées depuis models.json")
-
-# Aide presets
+# Aide : modes + glossaire
 with st.sidebar.expander("Aide · Modes & valeurs", expanded=False):
     st.markdown(
         """
@@ -697,87 +659,23 @@ Le **WRatio** (RapidFuzz) est basé sur la **distance d’édition** (pas un cos
 """
     )
 
-# Éditeur responses.json
-with st.sidebar.expander("Éditer les réponses (responses.json)", expanded=False):
+with st.sidebar.expander("Glossaire & Explications", expanded=False):
     st.markdown(
         """
-        Format attendu (extrait):
-
-        ```json
-        {
-          "intents": [
-            { "name": "advantages", "keywords": ["avantage", "points forts"] }
-          ],
-          "responses": {
-            "advantages": {
-              "generic": {"text": "Texte par défaut.", "url": null},
-              "by_category": {
-                "trail": {"text": "Texte pour trail.", "url": null}
-              },
-              "by_model": {
-                "Salomon Speedcross 6": {"text": "Texte précis.", "url": "https://exemple"}
-              }
-            }
-          }
-        }
-        ```
-        """
+- **Fenêtre (n-gram)** : taille des séquences de tokens testées par le fuzzy. Ici **fixée à 5** en interne
+  (on génère automatiquement 1..5 tokens : ex. “speedcross”, “speedcross 6”, …).  
+- **Span** : sous-chaîne continue du texte évaluée par le matcher (avec positions start/end).  
+- **Dictionnaire / Lexique** : liste de **tous les alias** issus de `models.json` (y compris le nom canonique).  
+  C’est contre **ce lexique** que RapidFuzz calcule la similarité.  
+- **Alias → Canonique** : si l’alias “Speed Cross 6” matche, on remonte vers **“Salomon Speedcross 6”**.  
+- **Garde-fou** “mot-clé ou chiffre” : ne teste en fuzzy que les spans contenant un chiffre (ex. *6*)  
+  **ou** un mot-clé (ultra, speed, pro, …) pour réduire les faux positifs.  
+- **Exact vs Fuzzy** : exact (PhraseMatcher) → score **1.0** ; fuzzy (RapidFuzz) → score **WRatio/100**.
+"""
     )
-    try:
-        r_text = RESP_PATH.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        r_text = json.dumps(load_responses_config(), ensure_ascii=False, indent=2)
-    edited = st.text_area("Contenu JSON", value=r_text, height=300, label_visibility="collapsed", key="responses_text_area")
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Enregistrer", key="save_responses"):
-            try:
-                json.loads(edited)
-                RESP_PATH.write_text(edited, encoding="utf-8")
-                st.success("Sauvegardé ✔")
-            except Exception as e:
-                st.error(f"JSON invalide: {e}")
-    with col2:
-        if st.button("Réinitialiser depuis disque", key="reset_responses"):
-            st.rerun()
-
 
 # ========= MAIN =========
 st.title("Chatbot NER – Modèles Salomon")
-st.caption("Démonstrateur pédagogique: reconnaissance de modèles par règles + fuzzy matching (simplifié)")
+st.caption("Démonstrateur pédagogique : NER par règles + fuzzy matching (simplifié)")
 
-col_left, col_right = st.columns([2, 1])
-
-with col_left:
-    if st.button(" Vider la conversation"):
-        st.session_state.messages = []
-        st.session_state["context_canos"] = []
-        st.rerun()
-
-    # Historique
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            if msg["role"] == "user" and msg.get("entities"):
-                html_text = highlight_html(msg["content"], msg["entities"])
-                st.markdown(html_text, unsafe_allow_html=True)
-            else:
-                st.write(msg["content"])
-
-    # Saisie inline
-    pending = st.session_state.get("pending_prompt")
-    with st.form("inline_chat_form"):
-        user_input = st.text_input("Votre message", value="", key="inline_chat_text")
-        submitted = st.form_submit_button("Envoyer")
-    if pending is not None:
-        prompt = pending
-        st.session_state["pending_prompt"] = None
-    elif submitted and user_input.strip():
-        prompt = user_input.strip()
-    else:
-        prompt = None
-
-    if prompt:
-        # Message utilisateur
-        ents = pipeline.extract(prompt)
-        st.session_state.messages.append({"role": "user", "content": prompt, "entities": ents})
-        with st
+col_left, c_
