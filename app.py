@@ -1,24 +1,291 @@
 from __future__ import annotations
 
+# === Imports ===
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
+from dataclasses import dataclass, asdict
 import json
 import html
+import re
 
 import streamlit as st
+import spacy
 from spacy.matcher import PhraseMatcher
 
-from ner import NERPipeline, EntityMatch
 
-
-# --- Config ---
+# === Config de page & chemins ===
 st.set_page_config(page_title="Salomon NER Chatbot", layout="wide")
 ROOT = Path(__file__).parent
 DATA_PATH = ROOT / "data" / "models.json"
 RESP_PATH = ROOT / "data" / "responses.json"
 
 
-# --- Utils UI ---
+# === NER minimal intégré (plus de package externe) ===
+@dataclass
+class EntityMatch:
+    text: str
+    start: int
+    end: int
+    label: str
+    canonical: str
+    method: str  # "exact" | "fuzzy"
+    score: float  # 0..1
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["score"] = round(self.score, 4)
+        return d
+
+
+class NERPipeline:
+    """Pipeline NER simple: PhraseMatcher (exact-ish) + fuzzy (RapidFuzz, optionnel)."""
+
+    def __init__(self, data_path: Path, fuzzy_threshold: int = 88) -> None:
+        self.data_path = data_path
+
+        # spaCy: on essaie le modèle FR, sinon pipeline blank
+        try:
+            self.nlp = spacy.load("fr_core_news_sm", disable=["parser", "ner", "lemmatizer", "tagger"])
+        except Exception:
+            self.nlp = spacy.blank("fr")
+
+        # Fuzzy options (modifiables via la sidebar)
+        self.fuzzy_preset: str = "balanced"
+        self.fuzzy_threshold: int = fuzzy_threshold
+        self.enable_fuzzy: bool = True
+        self.min_fuzzy_span_len: int = 5  # sans espaces
+        self.require_keyword_or_digit: bool = True
+        self.keyword_regex_str: str = r"(speed|cross|ultra|sense|ride|xa|pro|x\s?ultra|supercross|speedcross|super|x\s?pro)"
+        self.max_ngram: int = 5
+
+        # RapidFuzz dispo ?
+        try:
+            from rapidfuzz import process as _p, fuzz as _f  # noqa: F401
+            self.has_rapidfuzz = True
+        except Exception:
+            self.has_rapidfuzz = False
+            self.enable_fuzzy = False
+            self.fuzzy_preset = "off"
+
+        # Index & matchers
+        self._models_data: Dict[str, dict] = {}
+        self._label_by_cano: Dict[str, str] = {}
+        self._aliases_by_cano: Dict[str, List[str]] = {}
+        self._lexicon: List[str] = []
+        self._cano_by_alias_low: Dict[str, str] = {}
+
+        self._pm: Optional[PhraseMatcher] = None
+        self.reload()
+
+    # --- API de config utilisée par l'UI ---
+    def set_fuzzy_preset(self, key: str) -> None:
+        if not self.has_rapidfuzz:
+            self.enable_fuzzy = False
+            self.fuzzy_preset = "off"
+            return
+        key = key or "balanced"
+        self.fuzzy_preset = key
+        if key == "off":
+            self.enable_fuzzy = False
+        elif key == "aggressive":
+            self.enable_fuzzy = True
+            self.fuzzy_threshold = max(self.fuzzy_threshold, 80)
+            self.min_fuzzy_span_len = 4
+            self.require_keyword_or_digit = True
+            self.max_ngram = 6
+        else:  # balanced
+            self.enable_fuzzy = True
+            self.fuzzy_threshold = 88
+            self.min_fuzzy_span_len = 5
+            self.require_keyword_or_digit = True
+            self.max_ngram = 5
+
+    def set_threshold(self, value: int) -> None:
+        self.fuzzy_threshold = int(value)
+
+    def set_fuzzy_options(
+        self,
+        enable_fuzzy: bool,
+        min_span_len: int,
+        require_kw_or_digit: bool,
+        keyword_regex_str: str,
+        max_ngram: int,
+    ) -> None:
+        self.enable_fuzzy = bool(enable_fuzzy and self.has_rapidfuzz)
+        self.min_fuzzy_span_len = int(min_span_len)
+        self.require_keyword_or_digit = bool(require_kw_or_digit)
+        self.keyword_regex_str = keyword_regex_str or self.keyword_regex_str
+        self.max_ngram = int(max(1, max_ngram))
+
+    # --- Chargement des données & règles ---
+    def reload(self) -> None:
+        self._load_entities()
+        self._build_phrase_matcher()
+
+    def _load_entities(self) -> None:
+        """Charge entities depuis models.json. Format attendu souple:
+        {
+          "entities": [
+            {"canonical": "Salomon Speedcross 6", "label": "MODEL", "category": "trail", "url": "...",
+             "aliases": ["Speedcross 6", "Speed Cross 6"]}
+          ]
+        }
+        """
+        self._models_data.clear()
+        self._label_by_cano.clear()
+        self._aliases_by_cano.clear()
+        self._lexicon.clear()
+        self._cano_by_alias_low.clear()
+
+        try:
+            data = json.loads(self.data_path.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+
+        for ent in data.get("entities", []):
+            cano = (ent.get("canonical") or "").strip()
+            if not cano:
+                continue
+            label = ent.get("label") or "MODEL"
+            aliases = set([cano])
+            for a in ent.get("aliases", []) or []:
+                a = (a or "").strip()
+                if a:
+                    aliases.add(a)
+
+            self._models_data[cano] = ent
+            self._label_by_cano[cano] = label
+            self._aliases_by_cano[cano] = sorted(aliases, key=len, reverse=True)
+
+            for a in aliases:
+                self._lexicon.append(a)
+                self._cano_by_alias_low[a.lower()] = cano
+
+        # dédoublonner le lexique en conservant les plus longs d'abord
+        self._lexicon = sorted(list(dict.fromkeys(self._lexicon)), key=len, reverse=True)
+
+    def _build_phrase_matcher(self) -> None:
+        pm = PhraseMatcher(self.nlp.vocab, attr="LOWER")
+        for cano, aliases in self._aliases_by_cano.items():
+            if not aliases:
+                continue
+            patterns = [self.nlp.make_doc(a) for a in aliases]
+            pm.add(f"CANO::{cano}", patterns)
+        self._pm = pm
+
+    # --- Extraction ---
+    def extract(self, text: str) -> List[EntityMatch]:
+        if not text:
+            return []
+        doc = self.nlp.make_doc(text)
+
+        matches: List[EntityMatch] = []
+        # Exact-ish via PhraseMatcher
+        if self._pm:
+            for match_id, start, end in self._pm(doc):
+                rule = self.nlp.vocab.strings[match_id]  # e.g. CANO::Salomon Speedcross 6
+                cano = rule.split("::", 1)[1] if "::" in rule else None
+                span = doc[start:end]
+                if not cano or not span.text.strip():
+                    continue
+                label = self._label_by_cano.get(cano, "MODEL")
+                matches.append(
+                    EntityMatch(
+                        text=span.text,
+                        start=span.start_char,
+                        end=span.end_char,
+                        label=label,
+                        canonical=cano,
+                        method="exact",
+                        score=1.0,
+                    )
+                )
+
+        # Fuzzy (optionnel)
+        if self.enable_fuzzy and self.has_rapidfuzz:
+            matches.extend(self._fuzzy_spans(doc, text))
+
+        # Nettoyage: trier, fusionner overlaps par meilleur score, dédoublonner mêmes canoniques si superposés
+        matches = self._dedupe_overlaps(matches)
+        return sorted(matches, key=lambda m: (m.start, -m.end))
+
+    # --- Fuzzy interne ---
+    def _fuzzy_spans(self, doc, text: str) -> List[EntityMatch]:
+        from rapidfuzz import process, fuzz  # type: ignore
+
+        out: List[EntityMatch] = []
+        tokens = list(doc)
+        re_kw = re.compile(self.keyword_regex_str, re.I) if self.keyword_regex_str else None
+
+        # Génération de fenêtres token -> spans caractères
+        for i in range(len(tokens)):
+            for n in range(1, self.max_ngram + 1):
+                j = i + n
+                if j > len(tokens):
+                    break
+                span = doc[tokens[i].i : tokens[j - 1].i + 1]
+                s = span.text.strip()
+                if not s:
+                    continue
+                # Contraintes: longueur min sans espaces, mot-clé ou chiffre si exigé
+                if len(s.replace(" ", "")) < self.min_fuzzy_span_len:
+                    continue
+                if self.require_keyword_or_digit:
+                    if not (any(ch.isdigit() for ch in s) or (re_kw and re_kw.search(s))):
+                        continue
+
+                best = process.extractOne(s, self._lexicon, scorer=fuzz.WRatio, score_cutoff=self.fuzzy_threshold)
+                if not best:
+                    continue
+                best_alias, score = best[0], float(best[1])
+                cano = self._cano_by_alias_low.get(best_alias.lower())
+                if not cano:
+                    continue
+                label = self._label_by_cano.get(cano, "MODEL")
+
+                out.append(
+                    EntityMatch(
+                        text=span.text,
+                        start=span.start_char,
+                        end=span.end_char,
+                        label=label,
+                        canonical=cano,
+                        method="fuzzy",
+                        score=max(0.0, min(1.0, score / 100.0)),
+                    )
+                )
+        return out
+
+    def _dedupe_overlaps(self, items: List[EntityMatch]) -> List[EntityMatch]:
+        if not items:
+            return []
+        # Trier: priorité aux exacts puis au score puis à la longueur
+        items = sorted(
+            items,
+            key=lambda m: (
+                0 if m.method == "exact" else 1,
+                -(m.score),
+                -(m.end - m.start),
+            ),
+        )
+        kept: List[EntityMatch] = []
+        occupied: List[Tuple[int, int]] = []
+
+        def overlaps(a: Tuple[int, int], b: Tuple[int, int]) -> bool:
+            return not (a[1] <= b[0] or b[1] <= a[0])
+
+        for m in items:
+            span = (m.start, m.end)
+            if any(overlaps(span, o) for o in occupied):
+                # si même canonique déjà gardée et même zone -> ignorer
+                # sinon on garde le meilleur grâce au tri
+                continue
+            kept.append(m)
+            occupied.append(span)
+        return kept
+
+
+# === Utils UI ===
 def highlight_html(text: str, matches: List[EntityMatch]) -> str:
     """Retourne une version HTML du texte avec les entités surlignées."""
     if not text:
@@ -44,173 +311,25 @@ def highlight_html(text: str, matches: List[EntityMatch]) -> str:
 def assistant_reply_from_entities(matches: List[EntityMatch]) -> str:
     if not matches:
         return "Je n'ai pas encore reconnu de modèle Salomon. Pouvez-vous préciser le nom du modèle ?"
-    # Regrouper par canonique et lister catégories si disponibles (optionnel)
     canos = list(dict((m.canonical, None) for m in matches).keys())
     if len(canos) == 1:
         return f"Je comprends que vous cherchez des informations sur le modèle : {canos[0]}"
     return "Je comprends que vous cherchez des informations sur les modèles : " + ", ".join(canos)
 
 
-# --- Session state ---
-if "pipeline" not in st.session_state:
-    st.session_state.pipeline = NERPipeline(DATA_PATH, fuzzy_threshold=88)
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []  # {role: user|assistant, content: str, entities: List[EntityMatch]}
-
-if "context_canos" not in st.session_state:
-    st.session_state.context_canos = []
-
-pipeline: NERPipeline = st.session_state.pipeline
-
-
-# --- Sidebar ---
-st.sidebar.header("Paramètres")
-
-# Disponibilité RapidFuzz
-rf_installed = getattr(pipeline, "has_rapidfuzz", False)
-
-# Préréglages de tolérance aux fautes
-preset_labels = {
-    "off": "Désactivé",
-    "balanced": "Équilibré",
-    "aggressive": "Agressif (fautes)",
-}
-label_to_key = {v: k for k, v in preset_labels.items()}
-cur_preset_key = getattr(pipeline, "fuzzy_preset", "balanced")
-if not rf_installed:
-    cur_preset_key = "off"
-
-preset_choice = st.sidebar.radio(
-    "Tolérance aux fautes",
-    options=list(preset_labels.values()),
-    index=[*preset_labels].index(cur_preset_key),
-    help="Choisis un profil: Désactivé, Équilibré (par défaut) ou Agressif pour tolérer davantage les fautes.",
-)
-
-pipeline.set_fuzzy_preset(label_to_key[preset_choice])
-
-# Seuil fuzzy (WRatio) – agit comme override après le preset
-threshold = st.sidebar.slider(
-    "Seuil fuzzy (WRatio)", min_value=70, max_value=100, value=pipeline.fuzzy_threshold, step=1,
-    help="Plus le seuil est haut, moins il y a de correspondances approximatives (faux positifs).",
-)
-pipeline.set_threshold(threshold)
-
-# Options avancées (fuzzy)
-with st.sidebar.expander("Options avancées (fuzzy)", expanded=False):
-    enable_fuzzy_ui = st.checkbox(
-        "Activer le fuzzy matching",
-        value=(getattr(pipeline, "enable_fuzzy", False) and rf_installed),
-        disabled=not rf_installed,
-        help="Active/désactive l’appariement approximatif (RapidFuzz).",
-    )
-    min_len_ui = st.slider(
-        "Longueur minimale d'un span",
-        min_value=3,
-        max_value=20,
-        value=getattr(pipeline, "min_fuzzy_span_len", 5),
-        step=1,
-        help="Ignore les spans plus courts (sans espaces).",
-    )
-    require_ui = st.checkbox(
-        "Exiger mot-clé ou chiffre",
-        value=getattr(pipeline, "require_keyword_or_digit", True),
-        help="Réduit les faux positifs en exigeant un chiffre (souvent un numéro de modèle) ou un mot-clé (ultra, speed, pro, …).",
-    )
-    kw_regex_ui = st.text_input(
-        "Regex mots-clés",
-        value=getattr(
-            pipeline,
-            "keyword_regex_str",
-            r"(speed|cross|ultra|sense|ride|xa|pro|x\s?ultra|supercross|speedcross|super|x\s?pro)",
-        ),
-        help="Définit les tokens ‘marque/modèle’ requis quand l’option est activée.",
-    )
-    max_ngram_ui = st.slider(
-        "Fenêtre max (n-gram)",
-        min_value=3,
-        max_value=8,
-        value=getattr(pipeline, "max_ngram", 5),
-        step=1,
-        help="Longueur maximale des fenêtres de texte comparées au lexique.",
-    )
-
-    pipeline.set_fuzzy_options(
-        enable_fuzzy=enable_fuzzy_ui,
-        min_span_len=min_len_ui,
-        require_kw_or_digit=require_ui,
-        keyword_regex_str=kw_regex_ui,
-        max_ngram=max_ngram_ui,
-    )
-
-# État
-if not rf_installed:
-    st.sidebar.warning("RapidFuzz n'est pas installé; la tolérance aux fautes est indisponible. Exécute `pip install -r requirements.txt` dans ton venv.")
-elif getattr(pipeline, "enable_fuzzy", False):
-    st.sidebar.caption(f"Fuzzy matching actif – Profil: {preset_choice} · Seuil: {pipeline.fuzzy_threshold}")
-else:
-    st.sidebar.info("Fuzzy matching désactivé.")
-
-if st.sidebar.button("Recharger le JSON et les règles"):
-    pipeline.reload()
-    st.sidebar.success("Règles rechargées depuis models.json")
-
-with st.sidebar.expander("Éditer les réponses (responses.json)", expanded=False):
-    st.markdown(
-        """
-        Format attendu (extrait):
-
-        ```json
-        {
-          "intents": [
-            { "name": "advantages", "keywords": ["avantage", "points forts"] }
-          ],
-          "responses": {
-            "advantages": {
-              "generic": {"text": "Texte par défaut.", "url": null},
-              "by_category": {
-                "trail": {"text": "Texte pour trail.", "url": null}
-              },
-              "by_model": {
-                "Salomon Speedcross 6": {"text": "Texte précis.", "url": "https://exemple"}
-              }
-            }
-          }
-        }
-        ```
-        """
-    )
-    try:
-        r_text = RESP_PATH.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        # Charger la config par défaut puis la proposer à l'édition
-        r_text = json.dumps(load_responses_config(), ensure_ascii=False, indent=2)
-    edited = st.text_area("Contenu JSON", value=r_text, height=300, label_visibility="collapsed", key="responses_text_area")
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Enregistrer", key="save_responses"):
-            try:
-                json.loads(edited)  # validation basique
-                RESP_PATH.write_text(edited, encoding="utf-8")
-                st.success("Sauvegardé ✔")
-            except Exception as e:
-                st.error(f"JSON invalide: {e}")
-    with col2:
-        if st.button("Réinitialiser depuis disque", key="reset_responses"):
-            st.rerun()
-
-
-# --- Helpers: modèles, intentions et réponses (placés avant Main) ---
+# === Helpers: modèles, intentions et réponses (avant l’UI !) ===
 def load_models_index() -> dict:
-    """Retourne un index {canonical: {category: str, label: str, url: Optional[str]}} à partir de models.json."""
+    """Index {canonical: {category, label, url}} depuis models.json."""
     try:
         data = json.loads(DATA_PATH.read_text(encoding="utf-8"))
     except Exception:
         return {}
     idx = {}
     for ent in data.get("entities", []):
-        idx[ent.get("canonical")] = {
+        cano = ent.get("canonical")
+        if not cano:
+            continue
+        idx[cano] = {
             "category": ent.get("category"),
             "label": ent.get("label", "MODEL"),
             "url": ent.get("url"),
@@ -263,7 +382,6 @@ def load_responses_config() -> dict:
     }
 
     def merge_cfg(dflt: dict, custom: dict) -> dict:
-        # Fusion non destructive: on garde le custom et on complète avec le défaut
         merged_intents = list(custom.get("intents", []))
         existing = {i.get("name") for i in merged_intents}
         for it in dflt.get("intents", []):
@@ -277,7 +395,6 @@ def load_responses_config() -> dict:
             base = dflt.get("responses", {}).get(key, {})
             cur = custom_resp.get(key, {})
             out = {
-                # champs communs
                 "generic": cur.get("generic", base.get("generic")),
                 "by_category": cur.get("by_category", base.get("by_category", {})),
                 "by_model": cur.get("by_model", base.get("by_model", {})),
@@ -295,13 +412,8 @@ def load_responses_config() -> dict:
         return merge_cfg(default, {})
 
 
-def detect_intent(text: str, cfg: dict) -> str | None:
-    """Retourne l'intention détectée (nom) ou None si pas trouvée.
-
-    Règles:
-    - spaCy PhraseMatcher sur les mots-clés des intentions
-    - Fallback exact et fuzzy (RapidFuzz) si besoin
-    """
+def detect_intent(text: str, cfg: dict) -> Optional[str]:
+    """Retourne l'intention détectée (nom) ou None si pas trouvée."""
     low = (text or "").lower()
 
     # spaCy PhraseMatcher
@@ -406,7 +518,6 @@ def assistant_reply(user_text: str, matches: List[EntityMatch], fallback_canos: 
             t, u = resolve_text_url(gen_entry, gen_text or "Pouvez-vous préciser le modèle ?")
             return (t or "") + (f" [Fiche produit]({u})" if u else "")
 
-        # Sinon on demande le modèle
         return "Je n'ai pas encore reconnu de modèle Salomon. Pouvez-vous préciser le nom du modèle ?"
 
     if not intent:
@@ -423,7 +534,11 @@ def assistant_reply(user_text: str, matches: List[EntityMatch], fallback_canos: 
         # 1) Spécifique au modèle
         by_model = res_cfg.get("by_model", {})
         if m in by_model:
-            t, u = resolve_text_url(by_model[m], (res_cfg.get("generic") or {}).get("text") if isinstance(res_cfg.get("generic"), dict) else res_cfg.get("generic"), m)
+            t, u = resolve_text_url(
+                by_model[m],
+                (res_cfg.get("generic") or {}).get("text") if isinstance(res_cfg.get("generic"), dict) else res_cfg.get("generic"),
+                m,
+            )
             reply = f"Je comprends que vous cherchez des informations sur le modèle : {m}. {t}"
             if u:
                 reply += f" [Fiche produit]({u})"
@@ -476,7 +591,152 @@ def assistant_reply(user_text: str, matches: List[EntityMatch], fallback_canos: 
     return "Je comprends que vous cherchez des informations sur les modèles :\n" + "\n".join(lines)
 
 
-# --- Main ---
+# === Session state & Pipeline ===
+if "pipeline" not in st.session_state:
+    st.session_state.pipeline = NERPipeline(DATA_PATH, fuzzy_threshold=88)
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []  # {role: user|assistant, content: str, entities: List[EntityMatch]}
+
+if "context_canos" not in st.session_state:
+    st.session_state.context_canos = []
+
+pipeline: NERPipeline = st.session_state.pipeline
+
+
+# === SIDEBAR ===
+st.sidebar.header("Paramètres")
+
+rf_installed = getattr(pipeline, "has_rapidfuzz", False)
+
+preset_labels = {
+    "off": "Désactivé",
+    "balanced": "Équilibré",
+    "aggressive": "Agressif (fautes)",
+}
+label_to_key = {v: k for k, v in preset_labels.items()}
+cur_preset_key = getattr(pipeline, "fuzzy_preset", "balanced")
+if not rf_installed:
+    cur_preset_key = "off"
+
+preset_choice = st.sidebar.radio(
+    "Tolérance aux fautes",
+    options=list(preset_labels.values()),
+    index=[*preset_labels].index(cur_preset_key),
+    help="Choisis un profil: Désactivé, Équilibré (par défaut) ou Agressif pour tolérer davantage les fautes.",
+)
+
+pipeline.set_fuzzy_preset(label_to_key[preset_choice])
+
+threshold = st.sidebar.slider(
+    "Seuil fuzzy (WRatio)", min_value=70, max_value=100, value=pipeline.fuzzy_threshold, step=1,
+    help="Plus le seuil est haut, moins il y a de correspondances approximatives (faux positifs).",
+)
+pipeline.set_threshold(threshold)
+
+with st.sidebar.expander("Options avancées (fuzzy)", expanded=False):
+    enable_fuzzy_ui = st.checkbox(
+        "Activer le fuzzy matching",
+        value=(getattr(pipeline, "enable_fuzzy", False) and rf_installed),
+        disabled=not rf_installed,
+        help="Active/désactive l’appariement approximatif (RapidFuzz).",
+    )
+    min_len_ui = st.slider(
+        "Longueur minimale d'un span",
+        min_value=3,
+        max_value=20,
+        value=getattr(pipeline, "min_fuzzy_span_len", 5),
+        step=1,
+        help="Ignore les spans plus courts (sans espaces).",
+    )
+    require_ui = st.checkbox(
+        "Exiger mot-clé ou chiffre",
+        value=getattr(pipeline, "require_keyword_or_digit", True),
+        help="Réduit les faux positifs en exigeant un chiffre (souvent un numéro de modèle) ou un mot-clé (ultra, speed, pro, …).",
+    )
+    kw_regex_ui = st.text_input(
+        "Regex mots-clés",
+        value=getattr(
+            pipeline,
+            "keyword_regex_str",
+            r"(speed|cross|ultra|sense|ride|xa|pro|x\s?ultra|supercross|speedcross|super|x\s?pro)",
+        ),
+        help="Définit les tokens ‘marque/modèle’ requis quand l’option est activée.",
+    )
+    max_ngram_ui = st.slider(
+        "Fenêtre max (n-gram)",
+        min_value=3,
+        max_value=8,
+        value=getattr(pipeline, "max_ngram", 5),
+        step=1,
+        help="Longueur maximale des fenêtres de texte comparées au lexique.",
+    )
+
+    pipeline.set_fuzzy_options(
+        enable_fuzzy=enable_fuzzy_ui,
+        min_span_len=min_len_ui,
+        require_kw_or_digit=require_ui,
+        keyword_regex_str=kw_regex_ui,
+        max_ngram=max_ngram_ui,
+    )
+
+if not rf_installed:
+    st.sidebar.warning("RapidFuzz n'est pas installé; la tolérance aux fautes est indisponible. Exécute `pip install -r requirements.txt` dans ton venv.")
+elif getattr(pipeline, "enable_fuzzy", False):
+    st.sidebar.caption(f"Fuzzy matching actif – Profil: {preset_choice} · Seuil: {pipeline.fuzzy_threshold}")
+else:
+    st.sidebar.info("Fuzzy matching désactivé.")
+
+if st.sidebar.button("Recharger le JSON et les règles"):
+    pipeline.reload()
+    st.sidebar.success("Règles rechargées depuis models.json")
+
+with st.sidebar.expander("Éditer les réponses (responses.json)", expanded=False):
+    st.markdown(
+        """
+        Format attendu (extrait):
+
+        ```json
+        {
+          "intents": [
+            { "name": "advantages", "keywords": ["avantage", "points forts"] }
+          ],
+          "responses": {
+            "advantages": {
+              "generic": {"text": "Texte par défaut.", "url": null},
+              "by_category": {
+                "trail": {"text": "Texte pour trail.", "url": null}
+              },
+              "by_model": {
+                "Salomon Speedcross 6": {"text": "Texte précis.", "url": "https://exemple"}
+              }
+            }
+          }
+        }
+        ```
+        """
+    )
+    try:
+        r_text = RESP_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        # Charger la config par défaut puis la proposer à l'édition
+        r_text = json.dumps(load_responses_config(), ensure_ascii=False, indent=2)
+    edited = st.text_area("Contenu JSON", value=r_text, height=300, label_visibility="collapsed", key="responses_text_area")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Enregistrer", key="save_responses"):
+            try:
+                json.loads(edited)  # validation basique
+                RESP_PATH.write_text(edited, encoding="utf-8")
+                st.success("Sauvegardé ✔")
+            except Exception as e:
+                st.error(f"JSON invalide: {e}")
+    with col2:
+        if st.button("Réinitialiser depuis disque", key="reset_responses"):
+            st.rerun()
+
+
+# === MAIN ===
 st.title("Chatbot NER – Modèles Salomon")
 st.caption("Démonstrateur pédagogique: reconnaissance de modèles par règles + fuzzy matching")
 
@@ -488,16 +748,16 @@ with col_left:
         st.session_state["context_canos"] = []
         st.rerun()
 
-    # Affichage de l'historique
+    # Historique
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             if msg["role"] == "user" and msg.get("entities"):
                 html_text = highlight_html(msg["content"], msg["entities"])
                 st.markdown(html_text, unsafe_allow_html=True)
             else:
-                st.write(msg["content"]) 
+                st.write(msg["content"])
 
-    # Saisie utilisateur (prend en compte un éventuel prompt issu des suggestions) – inline sous la dernière réponse
+    # Saisie inline
     pending = st.session_state.get("pending_prompt")
     with st.form("inline_chat_form"):
         user_input = st.text_input("Votre message", value="", key="inline_chat_text")
@@ -509,6 +769,7 @@ with col_left:
         prompt = user_input.strip()
     else:
         prompt = None
+
     if prompt:
         # Ajouter message utilisateur
         ents = pipeline.extract(prompt)
@@ -517,10 +778,10 @@ with col_left:
             html_text = highlight_html(prompt, ents)
             st.markdown(html_text, unsafe_allow_html=True)
 
-        # Réponse assistant (simple logique déterministe)
+        # Réponse déterministe
         fallback_canos = st.session_state.get("context_canos", [])
         reply = assistant_reply(prompt, ents, fallback_canos=fallback_canos)
-        # Mettre à jour le contexte courant
+
         used_canos = list(dict((m.canonical, None) for m in ents).keys()) if ents else list(fallback_canos)
         st.session_state["context_canos"] = used_canos
         st.session_state.messages.append({"role": "assistant", "content": reply})
