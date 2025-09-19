@@ -14,7 +14,8 @@ from spacy.matcher import PhraseMatcher
 
 
 # ========= Config =========
-st.set_page_config(page_title="Salomon NER Chatbot")  # PAS de layout="wide"
+# PAS de layout="wide"
+st.set_page_config(page_title="Salomon NER Chatbot")
 ROOT = Path(__file__).parent
 DATA_PATH = ROOT / "data" / "models.json"
 RESP_PATH = ROOT / "data" / "responses.json"
@@ -40,8 +41,9 @@ class EntityMatch:
 # ========= Pipeline NER (ultra simplifié) =========
 class NERPipeline:
     """
-    - Exact : spaCy PhraseMatcher (alias depuis models.json).
-    - Fuzzy : RapidFuzz sur le MESSAGE ENTIER (pas de fenêtre/n-gram), scorer = partial_ratio.
+    - Exact : spaCy PhraseMatcher (alias depuis models.json) + fallback exact par sous-chaîne
+              (insensible à la casse, tolère espaces/traits d’union).
+    - Fuzzy : RapidFuzz sur le MESSAGE ENTIER (pas de fenêtre), scorer = partial_ratio.
     - Modes :
         * off        -> fuzzy=False
         * balanced   -> fuzzy=True,  threshold=88
@@ -78,7 +80,9 @@ class NERPipeline:
         # Matcher exact
         self._pm: Optional[PhraseMatcher] = None
 
-        self.reload()
+        # Chargement
+        self._load_entities()
+        self._build_phrase_matcher()
         self.set_fuzzy_preset(self.fuzzy_preset)
 
     # ----- Presets -----
@@ -107,10 +111,6 @@ class NERPipeline:
         self.fuzzy_preset = key
 
     # ----- Données -----
-    def reload(self) -> None:
-        self._load_entities()
-        self._build_phrase_matcher()
-
     def _load_entities(self) -> None:
         self._label_by_cano.clear()
         self._aliases_by_cano.clear()
@@ -140,6 +140,7 @@ class NERPipeline:
                 self._lexicon.append(a)
                 self._cano_by_alias_low[a.lower()] = cano
 
+        # Dédoublonner et trier
         self._lexicon = sorted(list(dict.fromkeys(self._lexicon)), key=len, reverse=True)
 
     def _build_phrase_matcher(self) -> None:
@@ -180,13 +181,43 @@ class NERPipeline:
                     )
                 )
 
-        # 2) Fuzzy (MESSAGE ENTIER, pas de n-gram)
+        # 1bis) Exact fallback par sous-chaîne (tolère espaces/traits d’union)
+        matches.extend(self._exact_substring_matches(text))
+
+        # 2) Fuzzy (MESSAGE ENTIER)
         if self.enable_fuzzy and self.has_rapidfuzz:
             matches.extend(self._fuzzy_full_message(text))
 
-        # Dédupe chevauchements
+        # Déduplication de chevauchements
         matches = self._dedupe_overlaps(matches)
         return sorted(matches, key=lambda m: (m.start, -m.end))
+
+    def _exact_substring_matches(self, text: str) -> List[EntityMatch]:
+        out: List[EntityMatch] = []
+        if not text:
+            return out
+        t = text
+        for alias in self._lexicon:
+            # Autoriser espaces/traits d’union interchangeables
+            pattern = re.escape(alias)
+            pattern = pattern.replace(r"\ ", r"[\s\-]+").replace(r"\-", r"[\s\-]+")
+            m = re.search(rf"(?i)\b{pattern}\b", t)
+            if not m:
+                continue
+            cano = self._cano_by_alias_low.get(alias.lower())
+            if not cano:
+                continue
+            label = self._label_by_cano.get(cano, "MODEL")
+            out.append(EntityMatch(
+                text=t[m.start():m.end()],
+                start=m.start(),
+                end=m.end(),
+                label=label,
+                canonical=cano,
+                method="exact",
+                score=1.0,
+            ))
+        return out
 
     def _fuzzy_full_message(self, text: str) -> List[EntityMatch]:
         """Compare le message ENTIER au lexique avec partial_ratio."""
@@ -234,6 +265,7 @@ class NERPipeline:
     def _dedupe_overlaps(self, items: List[EntityMatch]) -> List[EntityMatch]:
         if not items:
             return []
+        # Priorité : exact, puis meilleur score, puis plus long
         items = sorted(
             items,
             key=lambda m: (0 if m.method == "exact" else 1, -(m.score), -(m.end - m.start)),
@@ -351,21 +383,22 @@ def load_responses_config() -> dict:
         return merge_cfg(default, {})
 
 
-def detect_intent(text: str, cfg: dict) -> Optional[str]:
+def detect_intent(nlp, text: str, cfg: dict) -> Optional[str]:
     low = (text or "").lower()
-    pm = PhraseMatcher(pipeline.nlp.vocab, attr="LOWER")
+
+    pm = PhraseMatcher(nlp.vocab, attr="LOWER")
     label_to_intent = {}
     for it in cfg.get("intents", []):
         name = it.get("name")
         kws = [kw for kw in it.get("keywords", []) if kw]
         if not kws:
             continue
-        patterns = [pipeline.nlp.make_doc(kw) for kw in kws]
+        patterns = [nlp.make_doc(kw) for kw in kws]
         pm.add(f"INTENT::{name}", patterns)
         label_to_intent[f"INTENT::{name}"] = name
-    doc = pipeline.nlp.make_doc(text or "")
+    doc = nlp.make_doc(text or "")
     matches = pm(doc)
-    matched = [label_to_intent.get(pipeline.nlp.vocab.strings[m_id]) for m_id, _, _ in matches]
+    matched = [label_to_intent.get(nlp.vocab.strings[m_id]) for m_id, _, _ in matches]
     matched = [m for m in matched if m]
     if matched:
         priority = ["advantages", "price", "waterproof", "terrain"]
@@ -373,10 +406,14 @@ def detect_intent(text: str, cfg: dict) -> Optional[str]:
             if p in matched:
                 return p
         return matched[0]
+
+    # fallback "contains"
     for it in cfg.get("intents", []):
         for kw in it.get("keywords", []):
             if (kw or "").lower() in low:
                 return it.get("name")
+
+    # fuzzy des intentions (optionnel)
     try:
         from rapidfuzz import process, fuzz  # type: ignore
     except Exception:
@@ -418,7 +455,7 @@ def resolve_text_url(entry, fallback_text: str | None, model_name: str | None = 
     return text, url
 
 
-def assistant_reply(user_text: str, matches: List[EntityMatch], fallback_canos: list[str] | None = None) -> str:
+def assistant_reply(nlp, user_text: str, matches: List[EntityMatch], fallback_canos: list[str] | None = None) -> str:
     models_idx = load_models_index()
     cfg = load_responses_config()
 
@@ -429,7 +466,7 @@ def assistant_reply(user_text: str, matches: List[EntityMatch], fallback_canos: 
     else:
         canos = []
 
-    intent = detect_intent(user_text, cfg)
+    intent = detect_intent(nlp, user_text, cfg)
 
     if not canos:
         res_cfg = cfg.get("responses", {}).get(intent or "", {})
@@ -511,9 +548,6 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "context_canos" not in st.session_state:
     st.session_state.context_canos = []
-if "applied_preset" not in st.session_state:
-    st.session_state.applied_preset = pipeline.fuzzy_preset
-
 
 # ========= Sidebar (3 modes, explication incluse) =========
 st.sidebar.header("Paramètres")
@@ -521,87 +555,75 @@ st.sidebar.header("Paramètres")
 rf_installed = getattr(pipeline, "has_rapidfuzz", False)
 labels = {"off": "Désactivé", "balanced": "Équilibré", "aggressive": "Agressif"}
 
-current_key = st.session_state.applied_preset if rf_installed else "off"
 selected_key = st.sidebar.radio(
     "Mode de correspondance",
     options=list(labels.keys()),
-    index=list(labels.keys()).index(current_key),
+    index=list(labels.keys()).index(pipeline.fuzzy_preset if rf_installed else "off"),
     format_func=lambda k: labels[k],
 )
 
-# Appliquer le mode (un seul rerun contrôlé)
-if selected_key != st.session_state.applied_preset:
-    pipeline.set_fuzzy_preset(selected_key)
-    st.session_state.applied_preset = selected_key
-    st.experimental_rerun()
+# Appliquer le mode (pas de rerun manuel ; le radio relance déjà le script)
+pipeline.set_fuzzy_preset(selected_key)
 
-# Explication claire des modes (dans l'UI)
+# Explication claire des modes
 st.sidebar.markdown(
     """
 **Explications des modes**  
-- **Désactivé** : uniquement les alias exacts (PhraseMatcher). Aucune tolérance aux fautes.  
+- **Désactivé** : uniquement les alias exacts (PhraseMatcher + sous-chaîne). Aucune tolérance aux fautes.  
 - **Équilibré** : ajoute le fuzzy sur **le message entier** avec `partial_ratio ≥ 88`. Bon compromis précision/robustesse.  
 - **Agressif** : fuzzy plus tolérant (`partial_ratio ≥ 82`). Plus de rappels, risque de faux positifs accru.
 """
 )
 
-# Bouton reload
-if st.sidebar.button("Recharger models.json"):
-    pipeline.reload()
-    st.sidebar.info("Règles rechargées.")
+if not rf_installed and selected_key != "off":
+    st.sidebar.info("RapidFuzz introuvable : le fuzzy est désactivé (mode effectif = Désactivé).")
 
 
-# ========= Main =========
+# ========= Main (sans layout wide, interface simple) =========
 st.title("Chatbot NER – Modèles Salomon")
-st.caption("Exact (PhraseMatcher) + Fuzzy global (message entier)")
+st.caption("Exact (PhraseMatcher + sous-chaîne) + Fuzzy global (message entier)")
 
-col_left, col_right = st.columns([2, 1])
-
-with col_left:
-    if st.button("Vider la conversation"):
-        st.session_state.messages = []
-        st.session_state["context_canos"] = []
-
-    # Historique
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            if msg["role"] == "user" and msg.get("entities"):
-                html_text = highlight_html(msg["content"], msg["entities"])
-                st.markdown(html_text, unsafe_allow_html=True)
-            else:
-                st.write(msg["content"])
-
-    # Saisie
-    with st.form("inline_chat_form"):
-        user_input = st.text_input("Votre message", value="", key="inline_chat_text")
-        submitted = st.form_submit_button("Envoyer")
-
-    prompt = user_input.strip() if submitted and user_input.strip() else None
-
-    if prompt:
-        ents = pipeline.extract(prompt)
-        st.session_state.messages.append({"role": "user", "content": prompt, "entities": ents})
-        with st.chat_message("user"):
-            html_text = highlight_html(prompt, ents)
+# Historique
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        if msg["role"] == "user" and msg.get("entities"):
+            html_text = highlight_html(msg["content"], msg["entities"])
             st.markdown(html_text, unsafe_allow_html=True)
-
-        fallback_canos = st.session_state.get("context_canos", [])
-        reply = assistant_reply(prompt, ents, fallback_canos=fallback_canos)
-
-        used_canos = list(dict((m.canonical, None) for m in ents).keys()) if ents else list(fallback_canos)
-        st.session_state["context_canos"] = used_canos
-        st.session_state.messages.append({"role": "assistant", "content": reply})
-        with st.chat_message("assistant"):
-            st.markdown(reply)
-
-with col_right:
-    st.subheader("Inspector")
-    if st.session_state.messages:
-        last_user = next((m for m in reversed(st.session_state.messages) if m["role"] == "user"), None)
-        if last_user and last_user.get("entities"):
-            rows = [m.to_dict() for m in last_user["entities"]]
-            st.dataframe(rows, use_container_width=True)
         else:
-            st.info("Saisissez un message pour voir les entités reconnues.")
+            st.write(msg["content"])
+
+# Saisie
+with st.form("inline_chat_form"):
+    user_input = st.text_input("Votre message", value="", key="inline_chat_text")
+    submitted = st.form_submit_button("Envoyer")
+
+prompt = user_input.strip() if submitted and user_input.strip() else None
+
+if st.button("Vider la conversation"):
+    st.session_state.messages = []
+    st.session_state["context_canos"] = []
+
+if prompt:
+    ents = pipeline.extract(prompt)
+    st.session_state.messages.append({"role": "user", "content": prompt, "entities": ents})
+    with st.chat_message("user"):
+        html_text = highlight_html(prompt, ents)
+        st.markdown(html_text, unsafe_allow_html=True)
+
+    fallback_canos = st.session_state.get("context_canos", [])
+    reply = assistant_reply(pipeline.nlp, prompt, ents, fallback_canos=fallback_canos)
+
+    used_canos = list(dict((m.canonical, None) for m in ents).keys()) if ents else list(fallback_canos)
+    st.session_state["context_canos"] = used_canos
+    st.session_state.messages.append({"role": "assistant", "content": reply})
+    with st.chat_message("assistant"):
+        st.markdown(reply)
+
+# Inspector (simple)
+with st.expander("Inspector"):
+    last_user = next((m for m in reversed(st.session_state.messages) if m["role"] == "user"), None)
+    if last_user and last_user.get("entities"):
+        rows = [m.to_dict() for m in last_user["entities"]]
+        st.dataframe(rows, use_container_width=True)
     else:
-        st.info("Pas encore de messages.")
+        st.info("Saisissez un message pour voir les entités reconnues.")
