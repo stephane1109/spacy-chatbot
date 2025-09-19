@@ -1,0 +1,35 @@
+{
+  "trail": {
+    "text": "Pour le trail, choisissez selon votre terrain (boue, mixte, technique) et l’accroche souhaitée.",
+    "url": "https://www.salomon.com/fr-fr/trail-running",
+    "models": [
+      "Salomon Speedcross 6",
+      "Salomon Sense Ride 5",
+      "Salomon Supercross 4"
+    ]
+  },
+  "ultratrail": {
+    "text": "Pour l’ultratrail, optez pour l’amorti et la protection sur longue distance (crampons adaptés).",
+    "url": "https://www.salomon.com/fr-fr/trail-running",
+    "models": [
+      "Salomon Sense Ride 5"
+    ]
+  },
+  "marathon": {
+    "text": "Pour un marathon (route), privilégiez une chaussure route légère et réactive.",
+    "url": "https://www.salomon.com/fr-fr/running/route",
+    "models": []
+  },
+  "route": {
+    "text": "Pour la course sur route, préférez une semelle route avec dynamisme et déroulé fluide.",
+    "url": "https://www.salomon.com/fr-fr/running/route",
+    "models": []
+  },
+  "randonnee": {
+    "text": "Pour la randonnée, stabilité, maintien et adhérence sont prioritaires.",
+    "url": "https://www.salomon.com/fr-fr/outdoor/randonnee",
+    "models": [
+      "Salomon X Ultra 4"
+    ]
+  }
+}

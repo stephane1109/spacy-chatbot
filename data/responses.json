@@ -1,0 +1,55 @@
+{
+  "intents": [
+    { "name": "advantages", "keywords": ["avantage", "points forts", "bénéf", "pourquoi", "atout"] },
+    { "name": "price", "keywords": ["prix", "tarif", "coût", "combien"] },
+    { "name": "waterproof", "keywords": ["imperm", "gore-tex", "gtx", "étanch", "membrane"] },
+    { "name": "terrain", "keywords": ["terrain", "boue", "montagne", "trail", "rando", "hiking", "chemin", "route"] },
+    { "name": "availability", "keywords": ["disponible", "dispo", "stock", "livraison"] },
+    { "name": "sizing", "keywords": ["taille", "pointure", "grand", "petit", "taillent", "ajustement", "fit"] }
+  ],
+  "responses": {
+    "advantages": {
+      "generic": { "text": "Voici les points forts de ce modèle: accroche, stabilité et protection.", "url": null },
+      "by_category": {
+        "trail": { "text": "Trail: très bonne accroche (crampons), maintien du pied et protection.", "url": null },
+        "hiking": { "text": "Randonnée: confort et maintien, bonne adhérence et durabilité.", "url": null }
+      },
+      "by_model": {
+        "Salomon Speedcross 6": { "text": "Speedcross 6: accroche agressive, maintien précis, idéale en terrain meuble.", "url": "https://www.salomon.com/fr-fr/product/speedcross-6-lg9212/L47980500" },
+        "Salomon X Ultra 4": { "text": "X Ultra 4: stabilité en rando, accroche sur terrain technique, confort durable.", "url": "https://www.salomon.com/fr-fr/shop-emea/product/x-ultra-4.html" }
+      }
+    },
+    "price": {
+      "generic": { "text": "Je n’ai pas le prix exact. Je peux vous rediriger vers la fiche produit officielle.", "url": null },
+      "by_category": {},
+      "by_model": {}
+    },
+    "waterproof": {
+      "generic": { "text": "Selon la déclinaison GTX, le modèle peut être imperméable (membrane Gore-Tex).", "url": null },
+      "by_category": {
+        "trail": { "text": "En trail, privilégiez les versions GTX si vous cherchez l’imperméabilité.", "url": null }
+      },
+      "by_model": {}
+    },
+    "terrain": {
+      "generic": { "text": "Précisez votre terrain (boue, rocaille, sentier, route) pour une recommandation plus fine.", "url": null },
+      "by_category": {
+        "trail": { "text": "Adapté aux sentiers, selon le modèle: boue (crampons agressifs) ou terrain mixte.", "url": null },
+        "hiking": { "text": "Pensé pour la randonnée sur sentiers, chemins et terrains vallonnés.", "url": null }
+      },
+      "by_model": {}
+    },
+    "availability": {
+      "generic": { "text": "La disponibilité peut varier selon les tailles et couleurs. Consultez la fiche produit.", "url": null },
+      "by_category": {},
+      "by_model": {}
+    },
+    "sizing": {
+      "generic": { "text": "Ces modèles taillent généralement de façon standard. Si vous hésitez entre deux tailles, prenez la plus grande.", "url": null },
+      "by_category": {
+        "trail": { "text": "Pour le trail, laissez un peu d’espace à l’orteil pour les descentes.", "url": null }
+      },
+      "by_model": {}
+    }
+  }
+}
