@@ -1,25 +1,24 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional, Dict, Tuple
+from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, asdict
 import json
 import html
-import re
 
 import streamlit as st
 import spacy
 from spacy.matcher import PhraseMatcher
 
 
-# ================== Config ==================
-st.set_page_config(page_title="Salomon NER Chatbot")  # pas de layout wide
+# ============== Config ==============
+# PAS de layout="wide"
+st.set_page_config(page_title="Salomon NER + Fuzzy")
 ROOT = Path(__file__).parent
 DATA_PATH = ROOT / "data" / "models.json"
-RESP_PATH = ROOT / "data" / "responses.json"
 
 
-# ================== Data models ==================
+# ============== Modèles de données ==============
 @dataclass
 class EntityMatch:
     text: str
@@ -36,12 +35,12 @@ class EntityMatch:
         return d
 
 
-# ================== NER Pipeline ==================
+# ============== Pipeline ==============
 class NERPipeline:
     """
-    - Exact : spaCy PhraseMatcher + fallback sous-chaîne (insensible casse, tolère espaces/traits).
-    - Fuzzy  : RapidFuzz sur le MESSAGE ENTIER (partial_ratio), pas de fenêtre/n-gram.
-    - Modes  :
+    - Exact : spaCy PhraseMatcher (LOWER) alimenté par les alias du JSON.
+    - Fuzzy : RapidFuzz partial_ratio sur le MESSAGE ENTIER (pas de fenêtre).
+    - Modes :
         * off        -> fuzzy=False
         * balanced   -> fuzzy=True,  threshold=88
         * aggressive -> fuzzy=True,  threshold=82
@@ -50,31 +49,36 @@ class NERPipeline:
     def __init__(self, data_path: Path) -> None:
         self.data_path = data_path
 
+        # spaCy FR si dispo, sinon blank FR
         try:
             self.nlp = spacy.load("fr_core_news_sm", disable=["parser", "ner", "lemmatizer", "tagger"])
         except Exception:
             self.nlp = spacy.blank("fr")
 
+        # RapidFuzz ?
         try:
             from rapidfuzz import process as _p, fuzz as _f  # noqa: F401
             self.has_rapidfuzz = True
         except Exception:
             self.has_rapidfuzz = False
 
+        # Réglages par défaut
         self.fuzzy_preset: str = "balanced" if self.has_rapidfuzz else "off"
         self.enable_fuzzy: bool = bool(self.has_rapidfuzz)
         self.fuzzy_threshold: int = 88  # partial_ratio
 
+        # Données
         self._label_by_cano: Dict[str, str] = {}
         self._aliases_by_cano: Dict[str, List[str]] = {}
-        self._lexicon: List[str] = []
-        self._cano_by_alias_low: Dict[str, str] = {}
+        self._lexicon: List[str] = []               # tous alias (inclut canonical)
+        self._cano_by_alias_low: Dict[str, str] = {}  # alias.lower() -> cano
         self._pm: Optional[PhraseMatcher] = None
 
         self._load_entities()
         self._build_phrase_matcher()
         self.set_fuzzy_preset(self.fuzzy_preset)
 
+    # ---------- presets ----------
     def set_fuzzy_preset(self, key: str) -> None:
         if not self.has_rapidfuzz:
             self.enable_fuzzy = False
@@ -92,16 +96,18 @@ class NERPipeline:
             self.fuzzy_threshold = 88
         self.fuzzy_preset = key
 
-    # -------- data --------
+    # ---------- données ----------
     def _load_entities(self) -> None:
         self._label_by_cano.clear()
         self._aliases_by_cano.clear()
         self._lexicon.clear()
         self._cano_by_alias_low.clear()
+
         try:
             data = json.loads(self.data_path.read_text(encoding="utf-8"))
         except Exception:
             data = {}
+
         for ent in data.get("entities", []):
             cano = (ent.get("canonical") or "").strip()
             if not cano:
@@ -112,12 +118,16 @@ class NERPipeline:
                 a = (a or "").strip()
                 if a:
                     aliases.add(a)
+
             self._label_by_cano[cano] = label
             self._aliases_by_cano[cano] = sorted(aliases, key=len, reverse=True)
+
             for a in aliases:
                 self._lexicon.append(a)
                 self._cano_by_alias_low[a.lower()] = cano
-        self._lexicon = sorted(list(dict.fromkeys(self._lexicon)), key=len, reverse=True)
+
+        # dédoublonner
+        self._lexicon = list(dict.fromkeys(self._lexicon))
 
     def _build_phrase_matcher(self) -> None:
         pm = PhraseMatcher(self.nlp.vocab, attr="LOWER")
@@ -128,12 +138,12 @@ class NERPipeline:
             pm.add(f"CANO::{cano}", patterns)
         self._pm = pm
 
-    # -------- extraction --------
+    # ---------- extraction ----------
     def extract(self, text: str) -> List[EntityMatch]:
         if not text:
             return []
         doc = self.nlp.make_doc(text)
-        matches: List[EntityMatch] = []
+        out: List[EntityMatch] = []
 
         # 1) Exact (PhraseMatcher)
         if self._pm:
@@ -144,7 +154,7 @@ class NERPipeline:
                 if not cano or not span.text.strip():
                     continue
                 label = self._label_by_cano.get(cano, "MODEL")
-                matches.append(EntityMatch(
+                out.append(EntityMatch(
                     text=span.text,
                     start=span.start_char,
                     end=span.end_char,
@@ -154,47 +164,21 @@ class NERPipeline:
                     score=1.0,
                 ))
 
-        # 1bis) Fallback exact sous-chaîne (espaces/traits tolérés)
-        matches.extend(self._exact_substring_matches(text))
-
         # 2) Fuzzy global (message entier)
         if self.enable_fuzzy and self.has_rapidfuzz:
-            matches.extend(self._fuzzy_full_message(text))
+            out.extend(self._fuzzy_full_message(text))
 
-        matches = self._dedupe_overlaps(matches)
-        return sorted(matches, key=lambda m: (m.start, -m.end))
-
-    def _exact_substring_matches(self, text: str) -> List[EntityMatch]:
-        out: List[EntityMatch] = []
-        if not text:
-            return out
-        t = text
-        for alias in self._lexicon:
-            pattern = re.escape(alias)
-            pattern = pattern.replace(r"\ ", r"[\s\-]+").replace(r"\-", r"[\s\-]+")
-            m = re.search(rf"(?i)\b{pattern}\b", t)
-            if not m:
-                continue
-            cano = self._cano_by_alias_low.get(alias.lower())
-            if not cano:
-                continue
-            label = self._label_by_cano.get(cano, "MODEL")
-            out.append(EntityMatch(
-                text=t[m.start():m.end()],
-                start=m.start(),
-                end=m.end(),
-                label=label,
-                canonical=cano,
-                method="exact",
-                score=1.0,
-            ))
-        return out
+        # Déduplication basique
+        out = self._dedupe_overlaps(out)
+        return sorted(out, key=lambda m: (m.start, -m.end))
 
     def _fuzzy_full_message(self, text: str) -> List[EntityMatch]:
         from rapidfuzz import process, fuzz  # type: ignore
+
         s = (text or "").strip()
         if not s:
             return []
+
         results = process.extract(
             s,
             self._lexicon,
@@ -202,19 +186,26 @@ class NERPipeline:
             score_cutoff=self.fuzzy_threshold,
             limit=5
         )
+
         out: List[EntityMatch] = []
         for alias, score, _ in results:
             cano = self._cano_by_alias_low.get(alias.lower())
             if not cano:
                 continue
             label = self._label_by_cano.get(cano, "MODEL")
-            m = re.search(re.escape(alias), text, re.I)
-            if m:
-                start, end = m.start(), m.end()
+
+            # Localisation best-effort (pour surlignage) : recherche naïve (sans regex)
+            s_low = s.lower()
+            a_low = alias.lower()
+            pos = s_low.find(a_low)
+            if pos >= 0:
+                start, end = pos, pos + len(alias)
                 shown = text[start:end]
             else:
+                # si l'alias n'apparaît pas littéralement (cas fuzzy), on met tout le message
                 start, end = 0, len(text)
                 shown = text
+
             out.append(EntityMatch(
                 text=shown,
                 start=start,
@@ -226,13 +217,12 @@ class NERPipeline:
             ))
         return out
 
-    def _dedupe_overlaps(self, items: List[EntityMatch]) -> List[EntityMatch]:
+    @staticmethod
+    def _dedupe_overlaps(items: List[EntityMatch]) -> List[EntityMatch]:
         if not items:
             return []
-        items = sorted(
-            items,
-            key=lambda m: (0 if m.method == "exact" else 1, -(m.score), -(m.end - m.start)),
-        )
+        # Priorité : exact > meilleur score > span le plus long
+        items = sorted(items, key=lambda m: (0 if m.method == "exact" else 1, -(m.score), -(m.end - m.start)))
         kept: List[EntityMatch] = []
         occupied: List[Tuple[int, int]] = []
 
@@ -248,7 +238,7 @@ class NERPipeline:
         return kept
 
 
-# ================== UI helpers ==================
+# ============== UI helpers ==============
 def highlight_html(text: str, matches: List[EntityMatch]) -> str:
     if not text:
         return ""
@@ -259,341 +249,113 @@ def highlight_html(text: str, matches: List[EntityMatch]) -> str:
         if m.start > cur:
             out.append(html.escape(text[cur:m.start]))
         title = f"{m.label} → {m.canonical} ({m.method}, {int(m.score*100)}%)"
-        styled = (
+        out.append(
             f"<mark style='background-color:#fff3cd; padding:0 2px; border-radius:2px' "
             f"title='{html.escape(title)}'>{html.escape(text[m.start:m.end])}</mark>"
         )
-        out.append(styled)
         cur = m.end
     if cur < len(text):
         out.append(html.escape(text[cur:]))
     return "".join(out)
 
 
-# ================== Responses / intents (minimal) ==================
-def load_models_index() -> dict:
-    try:
-        data = json.loads(DATA_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    idx = {}
-    for ent in data.get("entities", []):
-        cano = ent.get("canonical")
-        if not cano:
-            continue
-        idx[cano] = {
-            "category": ent.get("category"),
-            "label": ent.get("label", "MODEL"),
-            "url": ent.get("url"),
-        }
-    return idx
-
-
-def load_responses_config() -> dict:
-    default = {
-        "intents": [
-            {"name": "advantages", "keywords": ["avantage", "points forts", "bénéf", "pourquoi", "atout"]},
-            {"name": "price", "keywords": ["prix", "tarif", "coût", "combien"]},
-            {"name": "waterproof", "keywords": ["imperm", "gore-tex", "gtx", "étanch", "membrane"]},
-            {"name": "terrain", "keywords": ["terrain", "boue", "montagne", "rocaille", "roche", "pierre", "chemin"]},
-        ],
-        "responses": {
-            "advantages": {
-                "generic": {"text": "Voici les points forts de ce modèle: accroche, stabilité et protection.", "url": None},
-                "by_category": {
-                    "trail": {"text": "Trail: très bonne accroche (crampons), maintien du pied et protection.", "url": None},
-                    "hiking": {"text": "Randonnée: confort et maintien, bonne adhérence et durabilité.", "url": None},
-                },
-                "by_model": {
-                    "Salomon Speedcross 6": {"text": "Speedcross 6: accroche agressive, maintien précis, idéale en terrain meuble.", "url": "https://www.salomon.com/fr-fr/shop-emea/product/speedcross-6.html"},
-                    "Salomon X Ultra 4": {"text": "X Ultra 4: stabilité en rando, accroche sur terrain technique, confort durable.", "url": "https://www.salomon.com/fr-fr/shop-emea/product/x-ultra-4.html"},
-                },
-            },
-            "price": {"generic": {"text": "Je n’ai pas le prix exact. Consultez la fiche produit.", "url": None}},
-            "waterproof": {"generic": {"text": "Version GTX = imperméable (membrane).", "url": None}},
-            "terrain": {"generic": {"text": "Précisez le terrain (boue, rocaille, sentier, route)…", "url": None}},
-        },
-    }
-
-    def merge_cfg(dflt: dict, custom: dict) -> dict:
-        merged_intents = list(custom.get("intents", []))
-        existing = {i.get("name") for i in merged_intents}
-        for it in dflt.get("intents", []):
-            if it.get("name") not in existing:
-                merged_intents.append(it)
-        merged_resp: dict = {}
-        custom_resp = custom.get("responses", {})
-        all_keys = set(dflt.get("responses", {}).keys()) | set(custom_resp.keys())
-        for key in all_keys:
-            base = dflt.get("responses", {}).get(key, {})
-            cur = custom_resp.get(key, {})
-            out = {
-                "generic": cur.get("generic", base.get("generic")),
-                "by_category": cur.get("by_category", base.get("by_category", {})),
-                "by_model": cur.get("by_model", base.get("by_model", {})),
-            }
-            merged_resp[key] = out
-        return {"intents": merged_intents, "responses": merged_resp}
-
-    try:
-        user_cfg = json.loads(RESP_PATH.read_text(encoding="utf-8"))
-        return merge_cfg(default, user_cfg)
-    except FileNotFoundError:
-        return default
-    except Exception:
-        return merge_cfg(default, {})
-
-
-def detect_intent(nlp, text: str, cfg: dict) -> Optional[str]:
-    low = (text or "").lower()
-    pm = PhraseMatcher(nlp.vocab, attr="LOWER")
-    label_to_intent = {}
-    for it in cfg.get("intents", []):
-        name = it.get("name")
-        kws = [kw for kw in it.get("keywords", []) if kw]
-        if not kws:
-            continue
-        patterns = [nlp.make_doc(kw) for kw in kws]
-        pm.add(f"INTENT::{name}", patterns)
-        label_to_intent[f"INTENT::{name}"] = name
-    doc = nlp.make_doc(text or "")
-    matches = pm(doc)
-    matched = [label_to_intent.get(nlp.vocab.strings[m_id]) for m_id, _, _ in matches]
-    matched = [m for m in matched if m]
-    if matched:
-        priority = ["advantages", "price", "waterproof", "terrain"]
-        for p in priority:
-            if p in matched:
-                return p
-        return matched[0]
-
-    for it in cfg.get("intents", []):
-        for kw in it.get("keywords", []):
-            if (kw or "").lower() in low:
-                return it.get("name")
-
-    try:
-        from rapidfuzz import process, fuzz  # type: ignore
-    except Exception:
-        return None
-    targets: List[str] = []
-    kw_to_intents: dict[str, List[str]] = {}
-    for it in cfg.get("intents", []):
-        name = it.get("name")
-        for kw in it.get("keywords", [])[:50]:
-            k = (kw or "").lower()
-            if not k:
-                continue
-            targets.append(k)
-            kw_to_intents.setdefault(k, []).append(name)
-    if not targets:
-        return None
-    best = process.extractOne(low, targets, scorer=fuzz.WRatio)
-    if not best or best[1] < 85:
-        return None
-    intents_for_kw = kw_to_intents.get(best[0], [])
-    priority = ["advantages", "price", "waterproof", "terrain"]
-    for p in priority:
-        if p in intents_for_kw:
-            return p
-    return intents_for_kw[0] if intents_for_kw else None
-
-
-def resolve_text_url(entry, fallback_text: str | None, model_name: str | None = None):
-    text, url = None, None
-    if isinstance(entry, dict):
-        text = entry.get("text")
-        url = entry.get("url")
-    elif isinstance(entry, str):
-        text = entry
-    if not text:
-        text = fallback_text or ""
-    if not url and model_name:
-        url = (load_models_index().get(model_name) or {}).get("url")
-    return text, url
-
-
-def assistant_reply(nlp, user_text: str, matches: List[EntityMatch], fallback_canos: list[str] | None = None) -> str:
-    models_idx = load_models_index()
-    cfg = load_responses_config()
-
-    if matches:
-        canos = list(dict((m.canonical, None) for m in matches).keys())
-    elif fallback_canos:
-        canos = list(dict((c, None) for c in fallback_canos).keys())
-    else:
-        canos = []
-
-    intent = detect_intent(nlp, user_text, cfg)
-
-    if not canos:
-        res_cfg = cfg.get("responses", {}).get(intent or "", {})
-        if isinstance(res_cfg, dict) and res_cfg.get("generic") is not None:
-            gen_entry = res_cfg.get("generic")
-            gen_text = gen_entry.get("text") if isinstance(gen_entry, dict) else gen_entry
-            t, u = resolve_text_url(gen_entry, gen_text or "Pouvez-vous préciser le modèle ?")
-            return (t or "") + (f" [Fiche produit]({u})" if u else "")
-        return "Je n'ai pas encore reconnu de modèle Salomon. Pouvez-vous préciser le nom du modèle ?"
-
-    if not intent:
-        if len(canos) == 1:
-            return f"Je comprends que vous cherchez des informations sur le modèle : {canos[0]}. Sur quel aspect souhaitez-vous de l’aide (ex: avantages, prix, imperméabilité, terrain) ?"
-        else:
-            return "Je comprends que vous cherchez des informations sur plusieurs modèles. Sur quel aspect souhaitez-vous de l’aide (ex: avantages, prix, imperméabilité, terrain) ?"
-
-    res_cfg = cfg.get("responses", {}).get(intent, {})
-
+def assistant_reply_from_entities(matches: List[EntityMatch]) -> str:
+    if not matches:
+        return "Je n’ai pas reconnu de modèle. Indiquez le nom exact (ou activez un mode fuzzy) ?"
+    canos = list(dict((m.canonical, None) for m in matches).keys())
     if len(canos) == 1:
-        m = canos[0]
-        by_model = res_cfg.get("by_model", {})
-        if m in by_model:
-            t, u = resolve_text_url(by_model[m], (res_cfg.get("generic") or {}).get("text") if isinstance(res_cfg.get("generic"), dict) else res_cfg.get("generic"), m)
-            reply = f"Je comprends que vous cherchez des informations sur le modèle : {m}. {t}"
-            if u:
-                reply += f" [Fiche produit]({u})"
-            return reply
-        cat = (models_idx.get(m) or {}).get("category")
-        by_cat = res_cfg.get("by_category", {})
-        if cat and cat in by_cat:
-            t, u = resolve_text_url(by_cat[cat], (res_cfg.get("generic") or {}).get("text") if isinstance(res_cfg.get("generic"), dict) else res_cfg.get("generic"), m)
-            reply = f"Je comprends que vous cherchez des informations sur le modèle : {m}. {t}"
-            if u:
-                reply += f" [Fiche produit]({u})"
-            return reply
-        gen_entry = res_cfg.get("generic")
-        gen_text = gen_entry.get("text") if isinstance(gen_entry, dict) else gen_entry
-        t, u = resolve_text_url(gen_entry, gen_text or "Je peux vous donner des informations générales sur ce modèle.", m)
-        reply = f"Je comprends que vous cherchez des informations sur le modèle : {m}. {t}"
-        if u:
-            reply += f" [Fiche produit]({u})"
-        return reply
-
-    lines = []
-    by_model = res_cfg.get("by_model", {})
-    by_cat = res_cfg.get("by_category", {})
-    gen_entry = res_cfg.get("generic")
-    gen_text = gen_entry.get("text") if isinstance(gen_entry, dict) else gen_entry or "Je peux vous donner des informations générales."
-    for m in canos:
-        if m in by_model:
-            t, u = resolve_text_url(by_model[m], gen_text, m)
-            line = f"- {m}: {t}"
-            if u:
-                line += f" [Fiche produit]({u})"
-            lines.append(line)
-            continue
-        cat = (models_idx.get(m) or {}).get("category")
-        if cat and cat in by_cat:
-            t, u = resolve_text_url(by_cat[cat], gen_text, m)
-            line = f"- {m}: {t}"
-            if u:
-                line += f" [Fiche produit]({u})"
-            lines.append(line)
-            continue
-        t, u = resolve_text_url(gen_entry, gen_text, m)
-        line = f"- {m}: {t}"
-        if u:
-            line += f" [Fiche produit]({u})"
-        lines.append(line)
-    return "Je comprends que vous cherchez des informations sur les modèles :\n" + "\n".join(lines)
+        return f"Modèle détecté : {canos[0]}"
+    return "Modèles détectés : " + ", ".join(canos)
 
 
-# ================== Session ==================
+# ============== Session ==============
 if "pipeline" not in st.session_state:
     st.session_state.pipeline = NERPipeline(DATA_PATH)
 pipeline: NERPipeline = st.session_state.pipeline
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "context_canos" not in st.session_state:
-    st.session_state.context_canos = []
-if "prev_preset" not in st.session_state:
-    st.session_state.prev_preset = pipeline.fuzzy_preset
+if "mode_prev" not in st.session_state:
+    st.session_state.mode_prev = pipeline.fuzzy_preset
 if "mode_changed" not in st.session_state:
     st.session_state.mode_changed = False
 
 
-# ================== Sidebar (3 modes) ==================
+# ============== Sidebar (3 modes) ==============
 st.sidebar.header("Paramètres")
 
-rf_installed = getattr(pipeline, "has_rapidfuzz", False)
+rf_ok = getattr(pipeline, "has_rapidfuzz", False)
 labels = {"off": "Désactivé", "balanced": "Équilibré", "aggressive": "Agressif"}
-current = st.session_state.prev_preset if rf_installed else "off"
+current = st.session_state.mode_prev if rf_ok else "off"
 
-selected_key = st.sidebar.radio(
+selected = st.sidebar.radio(
     "Mode de correspondance",
     options=list(labels.keys()),
     index=list(labels.keys()).index(current),
     format_func=lambda k: labels[k],
 )
 
-# Détecter changement de mode et l'appliquer
-if selected_key != st.session_state.prev_preset:
-    pipeline.set_fuzzy_preset(selected_key)
-    st.session_state.prev_preset = selected_key
-    st.session_state.mode_changed = True  # on ré-analysera le dernier message ci-dessous
+# Appliquer et marquer le changement (pas de st.rerun)
+if selected != st.session_state.mode_prev:
+    pipeline.set_fuzzy_preset(selected)
+    st.session_state.mode_prev = selected
+    st.session_state.mode_changed = True
 else:
     st.session_state.mode_changed = False
 
 st.sidebar.markdown(
     """
-**Explications des modes**  
-- **Désactivé** : uniquement les alias exacts (PhraseMatcher + sous-chaîne).  
-- **Équilibré** : ajoute le fuzzy sur **le message entier** avec `partial_ratio ≥ 88`.  
+**Modes**  
+- **Désactivé** : dictionnaire exact seulement.  
+- **Équilibré** : ajoute fuzzy (`partial_ratio ≥ 88`).  
 - **Agressif** : fuzzy plus tolérant (`partial_ratio ≥ 82`).  
 """
 )
 
-if not rf_installed and selected_key != "off":
-    st.sidebar.info("RapidFuzz introuvable : le fuzzy est désactivé (mode effectif = Désactivé).")
+with st.sidebar.expander("Diagnostic"):
+    st.write(f"RapidFuzz : **{'oui' if rf_ok else 'non'}**")
+    st.write(f"Modèles chargés : **{len(pipeline._aliases_by_cano)}**")
+    st.write(f"Alias chargés : **{len(pipeline._lexicon)}**")
+    if not rf_ok and selected != "off":
+        st.info("RapidFuzz indisponible : le fuzzy est inactif (mode effectif = Désactivé).")
 
 
-# ================== Main ==================
-st.title("Chatbot NER – Modèles Salomon")
-st.caption("Exact (PhraseMatcher + sous-chaîne) + Fuzzy global (message entier)")
+# ============== Main ==============
+st.title("Chatbot NER + Fuzzy (Salomon)")
 
 # Historique
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         if msg["role"] == "user" and msg.get("entities"):
-            html_text = highlight_html(msg["content"], msg["entities"])
-            st.markdown(html_text, unsafe_allow_html=True)
+            st.markdown(highlight_html(msg["content"], msg["entities"]), unsafe_allow_html=True)
         else:
             st.write(msg["content"])
 
-# Si le mode vient de changer, ré-analyser automatiquement le DERNIER message utilisateur
+# Ré-analyse auto si le mode a changé
 if st.session_state.mode_changed:
     last_user = next((m for m in reversed(st.session_state.messages) if m["role"] == "user"), None)
     if last_user:
         ents = pipeline.extract(last_user["content"])
-        # on n'écrase pas l'historique : on ajoute une réponse indiquant la ré-analyse
-        reply = assistant_reply(pipeline.nlp, last_user["content"], ents, fallback_canos=st.session_state.get("context_canos", []))
-        st.session_state["context_canos"] = list({m.canonical for m in ents})
-        st.session_state.messages.append({"role": "assistant", "content": f"(Ré-analysé en mode {labels[selected_key]})\n\n{reply}"})
+        reply = "(Analyse mise à jour — mode " + labels[selected] + ") " + assistant_reply_from_entities(ents)
+        st.session_state.messages.append({"role": "assistant", "content": reply, "entities": []})
 
 # Saisie
-with st.form("inline_chat_form"):
-    user_input = st.text_input("Votre message", value="", key="inline_chat_text")
-    submitted = st.form_submit_button("Envoyer")
+with st.form("chat_form"):
+    user_text = st.text_input("Votre message", value="")
+    sent = st.form_submit_button("Envoyer")
 
 if st.button("Vider la conversation"):
     st.session_state.messages = []
-    st.session_state["context_canos"] = []
 
-prompt = user_input.strip() if submitted and user_input.strip() else None
-
-if prompt:
-    ents = pipeline.extract(prompt)
-    st.session_state.messages.append({"role": "user", "content": prompt, "entities": ents})
+if sent and user_text.strip():
+    text = user_text.strip()
+    ents = pipeline.extract(text)
+    st.session_state.messages.append({"role": "user", "content": text, "entities": ents})
     with st.chat_message("user"):
-        html_text = highlight_html(prompt, ents)
-        st.markdown(html_text, unsafe_allow_html=True)
+        st.markdown(highlight_html(text, ents), unsafe_allow_html=True)
 
-    fallback_canos = st.session_state.get("context_canos", [])
-    reply = assistant_reply(pipeline.nlp, prompt, ents, fallback_canos=fallback_canos)
-
-    used_canos = list({m.canonical for m in ents}) if ents else list(fallback_canos)
-    st.session_state["context_canos"] = used_canos
-    st.session_state.messages.append({"role": "assistant", "content": reply})
+    reply = assistant_reply_from_entities(ents)
+    st.session_state.messages.append({"role": "assistant", "content": reply, "entities": []})
 
 # Inspector
 with st.expander("Inspector"):
@@ -602,4 +364,4 @@ with st.expander("Inspector"):
         rows = [m.to_dict() for m in last_user["entities"]]
         st.dataframe(rows, use_container_width=True)
     else:
-        st.info("Saisissez un message pour voir les entités reconnues.")
+        st.info("Envoyez un message pour voir les entités détectées.")
