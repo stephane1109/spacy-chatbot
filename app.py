@@ -42,7 +42,7 @@ class NERPipeline:
     Pipeline NER simplifié :
     - Exact : spaCy PhraseMatcher (tous les alias de models.json)
     - Fuzzy : RapidFuzz (WRatio) sur un lexique d’alias (score normalisé 0..1)
-    - Fenêtre n-gram interne fixée à 5 (non exposée dans l’UI)
+    - Fenêtre n-gram interne FIXÉE à 5 (non exposée dans l’UI)
     """
 
     def __init__(self, data_path: Path, fuzzy_threshold: int = 88) -> None:
@@ -645,37 +645,69 @@ with st.sidebar.expander("Options avancées (fuzzy)", expanded=False):
     if enable_fuzzy_ui != old_enable:
         st.rerun()
 
-# Aide : modes + glossaire
-with st.sidebar.expander("Aide · Modes & valeurs", expanded=False):
-    st.markdown(
-        """
-**Modes**  
-- **Désactivé** : pas d’approximation (fuzzy off).  
-- **Équilibré** : accepte un span si **WRatio ≥ 88** · longueur min **5** (sans espaces) · **mot-clé ou chiffre requis**.  
-- **Agressif** : accepte un span si **WRatio ≥ 82** · longueur min **4** · **mot-clé ou chiffre requis**.  
-
-**Score Inspector** = `WRatio / 100` (0..1).  
-Le **WRatio** (RapidFuzz) est basé sur la **distance d’édition** (pas un cosinus).
-"""
-    )
-
-with st.sidebar.expander("Glossaire & Explications", expanded=False):
-    st.markdown(
-        """
-- **Fenêtre (n-gram)** : taille des séquences de tokens testées par le fuzzy. Ici **fixée à 5** en interne
-  (on génère automatiquement 1..5 tokens : ex. “speedcross”, “speedcross 6”, …).  
-- **Span** : sous-chaîne continue du texte évaluée par le matcher (avec positions start/end).  
-- **Dictionnaire / Lexique** : liste de **tous les alias** issus de `models.json` (y compris le nom canonique).  
-  C’est contre **ce lexique** que RapidFuzz calcule la similarité.  
-- **Alias → Canonique** : si l’alias “Speed Cross 6” matche, on remonte vers **“Salomon Speedcross 6”**.  
-- **Garde-fou** “mot-clé ou chiffre” : ne teste en fuzzy que les spans contenant un chiffre (ex. *6*)  
-  **ou** un mot-clé (ultra, speed, pro, …) pour réduire les faux positifs.  
-- **Exact vs Fuzzy** : exact (PhraseMatcher) → score **1.0** ; fuzzy (RapidFuzz) → score **WRatio/100**.
-"""
-    )
+# Info simple : sur combien de mots l'analyse se fait (fixe)
+st.sidebar.caption("🔎 Fenêtre d’analyse : **1 à 5 tokens** (non modifiable).")
 
 # ========= MAIN =========
 st.title("Chatbot NER – Modèles Salomon")
 st.caption("Démonstrateur pédagogique : NER par règles + fuzzy matching (simplifié)")
 
-col_left, c_
+col_left, col_right = st.columns([2, 1])  # ← important : pas de variable tronquée !
+
+with col_left:
+    if st.button(" Vider la conversation"):
+        st.session_state.messages = []
+        st.session_state["context_canos"] = []
+        st.rerun()
+
+    # Historique
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            if msg["role"] == "user" and msg.get("entities"):
+                html_text = highlight_html(msg["content"], msg["entities"])
+                st.markdown(html_text, unsafe_allow_html=True)
+            else:
+                st.write(msg["content"])
+
+    # Saisie inline
+    pending = st.session_state.get("pending_prompt")
+    with st.form("inline_chat_form"):
+        user_input = st.text_input("Votre message", value="", key="inline_chat_text")
+        submitted = st.form_submit_button("Envoyer")
+    if pending is not None:
+        prompt = pending
+        st.session_state["pending_prompt"] = None
+    elif submitted and user_input.strip():
+        prompt = user_input.strip()
+    else:
+        prompt = None
+
+    if prompt:
+        # Message utilisateur
+        ents = pipeline.extract(prompt)
+        st.session_state.messages.append({"role": "user", "content": prompt, "entities": ents})
+        with st.chat_message("user"):
+            html_text = highlight_html(prompt, ents)
+            st.markdown(html_text, unsafe_allow_html=True)
+
+        # Réponse assistant (déterministe)
+        fallback_canos = st.session_state.get("context_canos", [])
+        reply = assistant_reply(prompt, ents, fallback_canos=fallback_canos)
+
+        used_canos = list(dict((m.canonical, None) for m in ents).keys()) if ents else list(fallback_canos)
+        st.session_state["context_canos"] = used_canos
+        st.session_state.messages.append({"role": "assistant", "content": reply})
+        with st.chat_message("assistant"):
+            st.markdown(reply)
+
+with col_right:
+    st.subheader("Inspector")
+    if st.session_state.messages:
+        last_user = next((m for m in reversed(st.session_state.messages) if m["role"] == "user"), None)
+        if last_user and last_user.get("entities"):
+            rows = [m.to_dict() for m in last_user["entities"]]
+            st.dataframe(rows, use_container_width=True)
+        else:
+            st.info("Saisis un message pour voir les entités reconnues.")
+    else:
+        st.info("Pas encore de messages.")
