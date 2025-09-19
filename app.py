@@ -14,7 +14,7 @@ from spacy.matcher import PhraseMatcher
 
 
 # ========= Config =========
-st.set_page_config(page_title="Salomon NER Chatbot")  # pas de layout="wide"
+st.set_page_config(page_title="Salomon NER Chatbot")  # PAS de layout="wide"
 ROOT = Path(__file__).parent
 DATA_PATH = ROOT / "data" / "models.json"
 RESP_PATH = ROOT / "data" / "responses.json"
@@ -37,11 +37,11 @@ class EntityMatch:
         return d
 
 
-# ========= Pipeline NER (simplifié) =========
+# ========= Pipeline NER (ultra simplifié) =========
 class NERPipeline:
     """
     - Exact : spaCy PhraseMatcher (alias depuis models.json).
-    - Fuzzy : RapidFuzz sur le MESSAGE ENTIER (pas de n-gram), scorer = partial_ratio.
+    - Fuzzy : RapidFuzz sur le MESSAGE ENTIER (pas de fenêtre/n-gram), scorer = partial_ratio.
     - Modes :
         * off        -> fuzzy=False
         * balanced   -> fuzzy=True,  threshold=88
@@ -57,7 +57,7 @@ class NERPipeline:
         except Exception:
             self.nlp = spacy.blank("fr")
 
-        # RapidFuzz ?
+        # RapidFuzz présent ?
         try:
             from rapidfuzz import process as _p, fuzz as _f  # noqa: F401
             self.has_rapidfuzz = True
@@ -72,13 +72,12 @@ class NERPipeline:
         # Données
         self._label_by_cano: Dict[str, str] = {}
         self._aliases_by_cano: Dict[str, List[str]] = {}
-        self._lexicon: List[str] = []                 # tous alias (y.c. canonical)
+        self._lexicon: List[str] = []                 # alias + canonical
         self._cano_by_alias_low: Dict[str, str] = {}  # alias.lower() -> canonique
 
         # Matcher exact
         self._pm: Optional[PhraseMatcher] = None
 
-        # Charge
         self.reload()
         self.set_fuzzy_preset(self.fuzzy_preset)
 
@@ -106,9 +105,6 @@ class NERPipeline:
             self.enable_fuzzy = True
             self.fuzzy_threshold = 88
         self.fuzzy_preset = key
-
-    def set_threshold(self, value: int) -> None:
-        self.fuzzy_threshold = int(value)
 
     # ----- Données -----
     def reload(self) -> None:
@@ -163,7 +159,7 @@ class NERPipeline:
 
         matches: List[EntityMatch] = []
 
-        # 1) Exact (PhraseMatcher) — sur tout le doc (classique)
+        # 1) Exact (PhraseMatcher)
         if self._pm:
             for match_id, start, end in self._pm(doc):
                 rule = self.nlp.vocab.strings[match_id]  # "CANO::<canonique>"
@@ -188,7 +184,7 @@ class NERPipeline:
         if self.enable_fuzzy and self.has_rapidfuzz:
             matches.extend(self._fuzzy_full_message(text))
 
-        # Dédupe chevauchements (priorité exact > meilleur score > plus long)
+        # Dédupe chevauchements
         matches = self._dedupe_overlaps(matches)
         return sorted(matches, key=lambda m: (m.start, -m.end))
 
@@ -200,12 +196,11 @@ class NERPipeline:
         if not s:
             return []
 
-        # Top-5 pour éviter le bruit
         results = process.extract(
             s,
             self._lexicon,
-            scorer=fuzz.partial_ratio,           # tolère texte additionnel autour de l'alias
-            score_cutoff=self.fuzzy_threshold,   # seuil selon le mode
+            scorer=fuzz.partial_ratio,         # tolère texte additionnel autour de l'alias
+            score_cutoff=self.fuzzy_threshold, # seuil fixé par le mode
             limit=5
         )
 
@@ -215,14 +210,14 @@ class NERPipeline:
             if not cano:
                 continue
             label = self._label_by_cano.get(cano, "MODEL")
-            # Tenter de localiser l'alias dans le message (approx.)
+            # localiser l'alias si possible
             m = re.search(re.escape(alias), text, re.I)
             if m:
                 start, end = m.start(), m.end()
                 shown = text[start:end]
             else:
                 start, end = 0, len(text)
-                shown = text  # fallback
+                shown = text
             out.append(
                 EntityMatch(
                     text=shown,
@@ -280,7 +275,7 @@ def highlight_html(text: str, matches: List[EntityMatch]) -> str:
     return "".join(out)
 
 
-# ========= Réponses / intentions (inchangé, minimal) =========
+# ========= Réponses / intentions (minimal) =========
 def load_models_index() -> dict:
     try:
         data = json.loads(DATA_PATH.read_text(encoding="utf-8"))
@@ -518,11 +513,9 @@ if "context_canos" not in st.session_state:
     st.session_state.context_canos = []
 if "applied_preset" not in st.session_state:
     st.session_state.applied_preset = pipeline.fuzzy_preset
-if "ui_threshold" not in st.session_state:
-    st.session_state.ui_threshold = pipeline.fuzzy_threshold
 
 
-# ========= Sidebar (très simple) =========
+# ========= Sidebar (3 modes, explication incluse) =========
 st.sidebar.header("Paramètres")
 
 rf_installed = getattr(pipeline, "has_rapidfuzz", False)
@@ -530,35 +523,32 @@ labels = {"off": "Désactivé", "balanced": "Équilibré", "aggressive": "Agress
 
 current_key = st.session_state.applied_preset if rf_installed else "off"
 selected_key = st.sidebar.radio(
-    "Mode",
+    "Mode de correspondance",
     options=list(labels.keys()),
     index=list(labels.keys()).index(current_key),
     format_func=lambda k: labels[k],
-    help="Désactivé: pas de fuzzy. Équilibré: seuil 88. Agressif: seuil 82.",
 )
 
 # Appliquer le mode (un seul rerun contrôlé)
 if selected_key != st.session_state.applied_preset:
     pipeline.set_fuzzy_preset(selected_key)
     st.session_state.applied_preset = selected_key
-    st.session_state.ui_threshold = pipeline.fuzzy_threshold
     st.experimental_rerun()
 
-# Seuil (optionnel, pour affiner sans changer de mode)
-st.session_state.ui_threshold = st.sidebar.slider(
-    "Seuil fuzzy (partial_ratio)",
-    min_value=70, max_value=100,
-    value=st.session_state.ui_threshold, step=1,
+# Explication claire des modes (dans l'UI)
+st.sidebar.markdown(
+    """
+**Explications des modes**  
+- **Désactivé** : uniquement les alias exacts (PhraseMatcher). Aucune tolérance aux fautes.  
+- **Équilibré** : ajoute le fuzzy sur **le message entier** avec `partial_ratio ≥ 88`. Bon compromis précision/robustesse.  
+- **Agressif** : fuzzy plus tolérant (`partial_ratio ≥ 82`). Plus de rappels, risque de faux positifs accru.
+"""
 )
-pipeline.set_threshold(st.session_state.ui_threshold)
 
 # Bouton reload
 if st.sidebar.button("Recharger models.json"):
     pipeline.reload()
     st.sidebar.info("Règles rechargées.")
-
-# Note explicite
-st.sidebar.caption("Fuzzy = comparaison du **message entier** au lexique (partial_ratio).")
 
 
 # ========= Main =========
