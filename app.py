@@ -96,7 +96,6 @@ def load_entities(path_str: str) -> Dict:
 def build_phrase_matcher_from_json(entities_json: str):
     """
     Construit le PhraseMatcher à partir d'une chaîne JSON (hashable).
-    Surtout NE PAS passer l'objet nlp en paramètre (non hashable).
     """
     nlp = load_nlp()
     data = json.loads(entities_json)
@@ -183,7 +182,7 @@ def compute_wratio_scores(user_text: str,
     results = process.extract(
         user_text,
         aliases,
-        scorer=fuzz.WRatio,   # même scorer que dans ton snippet
+        scorer=fuzz.WRatio,   # scorer demandé
         limit=len(aliases)
     )
 
@@ -253,10 +252,10 @@ if st.button("Vider la conversation"):
 # Traitement
 if sent and user_text.strip():
     text = user_text.strip()
-    ents = exact_spans(nlp, pm, text, cano_meta)  # pour surlignage exact
+    # Surlignage exact (NER dictionnaire)
+    ents = exact_spans(nlp, pm, text, cano_meta)
     st.session_state.history.append({"role": "user", "content": text, "entities": ents})
-
-    # Scores WRatio pour TOUS les modèles (best alias par modèle)
+    # Scores WRatio pour TOUS les modèles (meilleur alias par canonique)
     scores = compute_wratio_scores(text, all_aliases, alias_to_cano)
     st.session_state.last_scores = scores
 
@@ -283,42 +282,3 @@ if st.session_state.last_scores:
     st.dataframe(rows, use_container_width=True)
 else:
     st.info("Tape un message puis clique sur Envoyer pour calculer les scores.")
-
-# Démo WRatio (comme ton snippet)
-with st.expander("Exemple RapidFuzz (companies + WRatio)"):
-    st.code(
-        """from rapidfuzz import process, fuzz
-
-companies = [
-    "Apple Inc.",
-    "Apple Incorporated",
-    "APPLE INC",
-    "Microsoft Corporation",
-    "Microsoft Corp.",
-    "Google LLC",
-    "Alphabet Inc.",
-]
-
-matches = process.extract("apple incorporated", companies, scorer=fuzz.WRatio, limit=2)
-
-print("Best matches:")
-for match in matches:
-    print(f"Match: {match[0]}, Score: {match[1]:.3f}")""",
-        language="python",
-    )
-    if RAPIDFUZZ_OK:
-        companies = [
-            "Apple Inc.",
-            "Apple Incorporated",
-            "APPLE INC",
-            "Microsoft Corporation",
-            "Microsoft Corp.",
-            "Google LLC",
-            "Alphabet Inc.",
-        ]
-        demo = process.extract("apple incorporated", companies, scorer=fuzz.WRatio, limit=2)
-        st.write("Best matches:")
-        for alias, score, _ in demo:
-            st.write(f"- Match: {alias}, Score: {score:.3f}")
-    else:
-        st.warning("RapidFuzz non disponible — impossible d'exécuter la démo.")
