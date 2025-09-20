@@ -52,10 +52,10 @@ def charger_nlp():
         return spacy.blank("fr")
 
 @st.cache_resource(show_spinner=False)
-def lire_json_entites(chemin_str: str) -> dict:
+def lire_json_entites(chemin_str: str) -> dict | None:
     """
-    Lit le JSON des modèles. AUCUN fallback ici.
-    Retourne le dict si OK, sinon None (on gèrera hors du cache).
+    Lit le JSON des modèles. AUCUN fallback.
+    Retourne le dict si OK, sinon None.
     """
     p = Path(chemin_str)
     try:
@@ -205,12 +205,15 @@ def surligner_html(texte: str, matchs: List[CorrespondanceEntite]) -> str:
 def construire_reponse_assistant(texte: str,
                                  exacts: List[CorrespondanceEntite],
                                  scores: List[Dict],
-                                 meta_par_canonique: Dict[str, Dict]) -> str:
+                                 meta_par_canonique: Dict[str, Dict],
+                                 seuil_suggestion: float) -> str:
     """
     Réponse succincte :
     - si exact → confirme le(s) modèle(s) détecté(s) (+ URL si dispo)
-    - sinon → propose le meilleur candidat WRatio si score >= 80
+    - sinon → propose le meilleur candidat WRatio si score >= seuil_suggestion,
+              sinon indique la meilleure proximité.
     """
+    # 1) Exact trouvé
     if exacts:
         canos = list(dict((m.canonique, None) for m in exacts).keys())
         if len(canos) == 1:
@@ -220,19 +223,37 @@ def construire_reponse_assistant(texte: str,
             return base + (f" Fiche produit : {url}" if url else "")
         return "Modèles détectés : " + ", ".join(canos)
 
+    # 2) Pas d'exact → se baser sur le meilleur fuzzy
     if scores:
         top = scores[0]
-        if top["score"] >= 80:
-            cano = top["canonical"]
-            url = (meta_par_canonique.get(cano) or {}).get("url")
-            ans = f"Je pense que vous parlez de « {cano} » (score WRatio {top['score']:.0f})."
+        cano = top["canonical"]
+        url = (meta_par_canonique.get(cano) or {}).get("url")
+
+        if top["score"] >= float(seuil_suggestion):
+            ans = f"Je pense que vous parlez de « {cano} » (score WRatio {top['score']:.1f})."
             return ans + (f" Fiche produit : {url}" if url else "")
+        else:
+            hint = f"Meilleure proximité : « {cano} » (WRatio {top['score']:.1f})."
+            return "Je n’ai pas reconnu de modèle avec assez de certitude. " + hint
+
+    # 3) Aucun score calculable
     return "Je n’ai pas reconnu de modèle. Donnez le nom exact (ou une variante proche)."
 
 
 # ============== Interface principale ==============
 st.title("Chat NER (Salomon) + Scores WRatio")
 st.caption("• NER exact (PhraseMatcher) • Scores WRatio pour tous les modèles • Réponse après chaque requête")
+
+# ---- Contrôle du seuil de suggestion (UI) ----
+if "seuil_suggestion" not in st.session_state:
+    st.session_state.seuil_suggestion = 80  # valeur par défaut
+
+st.sidebar.header("Paramètre")
+st.session_state.seuil_suggestion = st.sidebar.slider(
+    "Seuil de suggestion (WRatio)",
+    min_value=0, max_value=100, value=st.session_state.seuil_suggestion, step=1,
+    help="Au-dessus de ce score, le chatbot propose directement le modèle le plus probable."
+)
 
 # Charger JSON (sans fallback) + matcher
 nlp = charger_nlp()
@@ -271,8 +292,10 @@ if envoyer and saisie.strip():
     scores = calculer_scores_wratio(texte, tous_alias, alias_vers_canonique)
     st.session_state.derniers_scores = scores
 
-    # 3) Réponse chatbot
-    reponse = construire_reponse_assistant(texte, entites, scores, meta_par_canonique)
+    # 3) Réponse chatbot (utilise le seuil de l'UI)
+    reponse = construire_reponse_assistant(
+        texte, entites, scores, meta_par_canonique, st.session_state.seuil_suggestion
+    )
     st.session_state.historique.append({"role": "assistant", "contenu": reponse, "entites": []})
 
 # Affichage historique
