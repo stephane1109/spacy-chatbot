@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # ================= Imports =================
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict
 from dataclasses import dataclass, asdict
 import json
 import html
@@ -20,8 +20,7 @@ except Exception:
 
 
 # ================= Config =================
-# PAS de layout wide
-st.set_page_config(page_title="Salomon NER • Scores de correspondance")
+st.set_page_config(page_title="Salomon NER • Scores de correspondance")  # pas de wide
 ROOT = Path(__file__).parent
 DATA_PATH = ROOT / "data" / "models.json"
 
@@ -43,10 +42,9 @@ class EntityMatch:
         return d
 
 
-# ================= Loaders (cachés correctement) =================
+# ================= Loaders (cache sûrs) =================
 @st.cache_resource(show_spinner=False)
 def load_nlp():
-    """Charge spaCy FR (ou blank FR). Aucun paramètre -> cache OK."""
     try:
         return spacy.load("fr_core_news_sm", disable=["parser", "ner", "lemmatizer", "tagger"])
     except Exception:
@@ -54,10 +52,6 @@ def load_nlp():
 
 @st.cache_resource(show_spinner=False)
 def load_entities(path_str: str) -> Dict:
-    """
-    Charge le JSON des modèles.
-    On passe un str (hashable) au lieu d'un Path pour le cache.
-    """
     path = Path(path_str)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -65,7 +59,7 @@ def load_entities(path_str: str) -> Dict:
             return data
     except Exception:
         pass
-    # Fallback d'exemple si le fichier n'est pas dispo sur le Cloud
+    # Fallback si le JSON n'est pas dispo (exemples Salomon)
     return {
         "entities": [
             {
@@ -95,7 +89,7 @@ def load_entities(path_str: str) -> Dict:
 @st.cache_resource(show_spinner=False)
 def build_phrase_matcher_from_json(entities_json: str):
     """
-    Construit le PhraseMatcher à partir d'une chaîne JSON (hashable).
+    Construit PhraseMatcher à partir d'une chaîne JSON (hashable pour le cache).
     """
     nlp = load_nlp()
     data = json.loads(entities_json)
@@ -131,7 +125,7 @@ def build_phrase_matcher_from_json(entities_json: str):
     return pm, alias_to_cano, cano_meta, all_aliases
 
 
-# ================= Exact match + Fuzzy scoring =================
+# ================= Exact + WRatio =================
 def exact_spans(nlp, pm, text: str, cano_meta: Dict[str, Dict]) -> List[EntityMatch]:
     if not text:
         return []
@@ -162,12 +156,10 @@ def compute_wratio_scores(user_text: str,
                           aliases: List[str],
                           alias_to_cano: Dict[str, str]) -> List[Dict]:
     """
-    Calcule un score WRatio pour CHAQUE alias, puis agrège au niveau canonique
-    (on garde le meilleur alias par modèle).
-    Retour : liste triée [{canonical, best_alias, score}] desc.
+    Score WRatio pour chaque alias, agrégé au niveau canonique (meilleur alias).
+    Retourne [{canonical, best_alias, score}] trié desc.
     """
     if not user_text.strip() or not RAPIDFUZZ_OK:
-        # Pas de RF -> scores 0
         best_by_cano: Dict[str, Dict] = {}
         for al in aliases:
             cano = alias_to_cano.get(al.lower(), "")
@@ -178,15 +170,13 @@ def compute_wratio_scores(user_text: str,
                 best_by_cano[cano] = {"canonical": cano, "best_alias": al, "score": 0.0}
         return sorted(best_by_cano.values(), key=lambda d: (-d["score"], d["canonical"]))
 
-    # 1) scores alias-level
     results = process.extract(
         user_text,
         aliases,
-        scorer=fuzz.WRatio,   # scorer demandé
+        scorer=fuzz.WRatio,    # on garde WRatio (pas de correctif 100%)
         limit=len(aliases)
     )
 
-    # 2) agrégation par canonique (meilleur alias)
     best_by_cano: Dict[str, Dict] = {}
     for alias, score, _ in results:
         cano = alias_to_cano.get(alias.lower())
@@ -220,29 +210,61 @@ def highlight_html(text: str, matches: List[EntityMatch]) -> str:
     return "".join(out)
 
 
+def build_assistant_reply(user_text: str,
+                          exact_entities: List[EntityMatch],
+                          scores: List[Dict],
+                          cano_meta: Dict[str, Dict]) -> str:
+    """
+    Réponse simple :
+    - Si exact → on confirme le(s) modèle(s) trouvé(s).
+    - Sinon → on propose le meilleur candidat WRatio (si score >= 80), avec score affiché.
+    """
+    if exact_entities:
+        canos = list(dict((m.canonical, None) for m in exact_entities).keys())
+        if len(canos) == 1:
+            cano = canos[0]
+            meta = cano_meta.get(cano, {})
+            url = meta.get("url")
+            base = f"Modèle détecté : {cano}."
+            return base + (f" Fiche produit : {url}" if url else "")
+        else:
+            lines = [f"- {c}" for c in canos]
+            return "Modèles détectés :\n" + "\n".join(lines)
+
+    # Pas d'exact → proposer le top fuzzy si suffisamment haut
+    if scores:
+        top = scores[0]
+        if top["score"] >= 80:
+            cano = top["canonical"]
+            meta = cano_meta.get(cano, {})
+            url = meta.get("url")
+            ans = f"Je suppose que vous parlez de « {cano} » (score WRatio {top['score']:.0f})."
+            return ans + (f" Fiche produit : {url}" if url else "")
+    return "Je n’ai pas reconnu de modèle. Donnez le nom exact ou une variante proche."
+
+
 # ================= Main UI =================
 st.title("Chat NER (Salomon) + Scores (WRatio)")
-st.caption("• NER exact (PhraseMatcher) • Scores RapidFuzz WRatio pour tous les modèles")
+st.caption("• NER exact (PhraseMatcher) • Tableau des scores WRatio pour tous les modèles • Réponse chatbot après chaque requête")
 
 # Charge modèles + matcher (via caches sûrs)
 nlp = load_nlp()
 entities_data = load_entities(str(DATA_PATH))
-entities_json = json.dumps(entities_data, sort_keys=True, ensure_ascii=False)  # hashable
+entities_json = json.dumps(entities_data, sort_keys=True, ensure_ascii=False)
 pm, alias_to_cano, cano_meta, all_aliases = build_phrase_matcher_from_json(entities_json)
 
-# État minimal
+# État
 if "history" not in st.session_state:
-    st.session_state.history = []
+    st.session_state.history = []   # [{role, content, entities}]
 if "last_scores" not in st.session_state:
     st.session_state.last_scores = []
 
-# Avertissement RapidFuzz
 if not RAPIDFUZZ_OK:
-    st.info("RapidFuzz n'est pas installé : les scores WRatio seront à 0. Ajoute `rapidfuzz` dans requirements.txt.")
+    st.info("RapidFuzz n'est pas installé : les scores WRatio seront à 0. Ajoute `rapidfuzz` au requirements.txt.")
 
 # Formulaire
 with st.form("chat_form"):
-    user_text = st.text_input("Votre message", value="", help="Ex: 'Je cherche la speedcross6 pour terrain boueux'")
+    user_text = st.text_input("Votre message", value="", help="Ex: 'Je voudrais des infos sur la Speedcross 6'")
     sent = st.form_submit_button("Envoyer")
 
 if st.button("Vider la conversation"):
@@ -252,17 +274,26 @@ if st.button("Vider la conversation"):
 # Traitement
 if sent and user_text.strip():
     text = user_text.strip()
-    # Surlignage exact (NER dictionnaire)
+
+    # 1) Exact pour surlignage
     ents = exact_spans(nlp, pm, text, cano_meta)
     st.session_state.history.append({"role": "user", "content": text, "entities": ents})
-    # Scores WRatio pour TOUS les modèles (meilleur alias par canonique)
+
+    # 2) Scores WRatio (tous les modèles)
     scores = compute_wratio_scores(text, all_aliases, alias_to_cano)
     st.session_state.last_scores = scores
 
-# Affichage historique (surlignage exact)
+    # 3) Réponse chatbot
+    reply = build_assistant_reply(text, ents, scores, cano_meta)
+    st.session_state.history.append({"role": "assistant", "content": reply, "entities": []})
+
+# Affichage historique
 for msg in st.session_state.history:
     with st.chat_message(msg["role"]):
-        st.markdown(highlight_html(msg["content"], msg.get("entities", [])), unsafe_allow_html=True)
+        if msg["role"] == "user":
+            st.markdown(highlight_html(msg["content"], msg.get("entities", [])), unsafe_allow_html=True)
+        else:
+            st.write(msg["content"])
 
 # Tableau des scores (tous les modèles)
 st.subheader("Scores de correspondance (WRatio) — Tous les modèles")
@@ -281,4 +312,4 @@ if st.session_state.last_scores:
     rows = sorted(rows, key=lambda r: (-r["Score"], r["Modèle (canonical)"]))
     st.dataframe(rows, use_container_width=True)
 else:
-    st.info("Tape un message puis clique sur Envoyer pour calculer les scores.")
+    st.info("Saisissez un message puis cliquez sur Envoyer pour voir les scores.")
