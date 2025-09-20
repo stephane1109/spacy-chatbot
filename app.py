@@ -22,7 +22,8 @@ except Exception:
 # ============== Config ==============
 st.set_page_config(page_title="Salomon NER • Scores WRatio")  # pas de wide
 RACINE = Path(__file__).parent
-CHEMIN_JSON = RACINE / "data" / "models.json"
+# CHEMIN_JSON = RACINE / "data" / "models.json"
+CHEMIN_JSON = RACINE / "data" / "models_cousernas.json"
 
 
 # ============== Données ==============
