@@ -22,7 +22,7 @@ except Exception:
 # ============== Config ==============
 st.set_page_config(page_title="Chatbot NER • Scores WRatio")  # pas de wide
 RACINE = Path(__file__).parent
-CHEMIN_JSON = RACINE / "data" / "models.json"
+CHEMIN_JSON = RACINE / "data" / "models_salomon.json"
 CHEMIN_JSON = RACINE / "data" / "models_couserans.json"
 
 
