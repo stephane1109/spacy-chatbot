@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# ================= Imports =================
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, asdict
@@ -10,15 +11,23 @@ import streamlit as st
 import spacy
 from spacy.matcher import PhraseMatcher
 
+# RapidFuzz est optionnel mais fortement recommandé
+try:
+    from rapidfuzz import process, fuzz  # type: ignore
+    RAPIDFUZZ_OK = True
+except Exception:
+    RAPIDFUZZ_OK = False
 
-# ============== Config ==============
-# PAS de layout="wide"
-st.set_page_config(page_title="Salomon NER + Fuzzy")
+
+# ================= Config =================
+# PAS de layout wide
+st.set_page_config(page_title="Salomon NER • Scores de correspondance")
+
 ROOT = Path(__file__).parent
 DATA_PATH = ROOT / "data" / "models.json"
 
 
-# ============== Modèles de données ==============
+# ================= Modèles de données =================
 @dataclass
 class EntityMatch:
     text: str
@@ -26,219 +35,141 @@ class EntityMatch:
     end: int
     label: str
     canonical: str
-    method: str   # "exact" | "fuzzy"
-    score: float  # 0..1
+    method: str   # "exact"
+    score: float  # 0..1 (pour l'exact on affiche 1.0)
 
     def to_dict(self) -> dict:
         d = asdict(self)
-        d["score"] = round(self.score, 4)
+        d["score"] = round(self.score, 3)
         return d
 
 
-# ============== Pipeline ==============
-class NERPipeline:
-    """
-    - Exact : spaCy PhraseMatcher (LOWER) alimenté par les alias du JSON.
-    - Fuzzy : RapidFuzz partial_ratio sur le MESSAGE ENTIER (pas de fenêtre).
-    - Modes :
-        * off        -> fuzzy=False
-        * balanced   -> fuzzy=True,  threshold=88
-        * aggressive -> fuzzy=True,  threshold=82
-    """
+# ================= Chargement NER + PhraseMatcher =================
+@st.cache_resource(show_spinner=False)
+def load_nlp():
+    """Charge spaCy FR (ou fallback blank)."""
+    try:
+        return spacy.load("fr_core_news_sm", disable=["parser", "ner", "lemmatizer", "tagger"])
+    except Exception:
+        return spacy.blank("fr")
 
-    def __init__(self, data_path: Path) -> None:
-        self.data_path = data_path
+@st.cache_resource(show_spinner=False)
+def load_entities(path: Path) -> Dict:
+    """Charge le JSON des modèles. Si absent/HS, fournit un jeu d'exemple."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "entities" in data and len(data["entities"]) > 0:
+            return data
+    except Exception:
+        pass
+    # Fallback : exemples Salomon
+    return {
+        "entities": [
+            {
+                "canonical": "Salomon Speedcross 6",
+                "aliases": ["Speedcross 6", "speedcross6", "speed cross 6"],
+                "label": "MODEL",
+                "category": "trail",
+                "url": "https://www.salomon.com/fr-fr/shop-emea/product/speedcross-6.html"
+            },
+            {
+                "canonical": "Salomon X Ultra 4",
+                "aliases": ["X Ultra 4", "x-ultra-4", "xultra4", "X ULTRA4"],
+                "label": "MODEL",
+                "category": "hiking",
+                "url": "https://www.salomon.com/fr-fr/shop-emea/product/x-ultra-4.html"
+            },
+            {
+                "canonical": "Salomon Sense Ride 5",
+                "aliases": ["Sense Ride 5", "senseride5", "sense-ride-5"],
+                "label": "MODEL",
+                "category": "trail",
+                "url": "https://www.salomon.com/fr-fr/shop-emea/product/sense-ride-5.html"
+            }
+        ]
+    }
 
-        # spaCy FR si dispo, sinon blank FR
-        try:
-            self.nlp = spacy.load("fr_core_news_sm", disable=["parser", "ner", "lemmatizer", "tagger"])
-        except Exception:
-            self.nlp = spacy.blank("fr")
+@st.cache_resource(show_spinner=False)
+def build_phrase_matcher(nlp, entities_data: Dict):
+    """Construit un PhraseMatcher sur canonical + aliases (attr=LOWER)."""
+    pm = PhraseMatcher(nlp.vocab, attr="LOWER")
+    alias_to_cano: Dict[str, str] = {}
+    cano_meta: Dict[str, Dict] = {}
+    all_aliases: List[str] = []
 
-        # RapidFuzz ?
-        try:
-            from rapidfuzz import process as _p, fuzz as _f  # noqa: F401
-            self.has_rapidfuzz = True
-        except Exception:
-            self.has_rapidfuzz = False
-
-        # Réglages par défaut
-        self.fuzzy_preset: str = "balanced" if self.has_rapidfuzz else "off"
-        self.enable_fuzzy: bool = bool(self.has_rapidfuzz)
-        self.fuzzy_threshold: int = 88  # partial_ratio
-
-        # Données
-        self._label_by_cano: Dict[str, str] = {}
-        self._aliases_by_cano: Dict[str, List[str]] = {}
-        self._lexicon: List[str] = []               # tous alias (inclut canonical)
-        self._cano_by_alias_low: Dict[str, str] = {}  # alias.lower() -> cano
-        self._pm: Optional[PhraseMatcher] = None
-
-        self._load_entities()
-        self._build_phrase_matcher()
-        self.set_fuzzy_preset(self.fuzzy_preset)
-
-    # ---------- presets ----------
-    def set_fuzzy_preset(self, key: str) -> None:
-        if not self.has_rapidfuzz:
-            self.enable_fuzzy = False
-            self.fuzzy_preset = "off"
-            return
-        key = (key or "balanced").lower()
-        if key == "off":
-            self.enable_fuzzy = False
-            self.fuzzy_threshold = 100
-        elif key == "aggressive":
-            self.enable_fuzzy = True
-            self.fuzzy_threshold = 82
-        else:
-            self.enable_fuzzy = True
-            self.fuzzy_threshold = 88
-        self.fuzzy_preset = key
-
-    # ---------- données ----------
-    def _load_entities(self) -> None:
-        self._label_by_cano.clear()
-        self._aliases_by_cano.clear()
-        self._lexicon.clear()
-        self._cano_by_alias_low.clear()
-
-        try:
-            data = json.loads(self.data_path.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-
-        for ent in data.get("entities", []):
-            cano = (ent.get("canonical") or "").strip()
-            if not cano:
+    for ent in entities_data.get("entities", []):
+        cano = (ent.get("canonical") or "").strip()
+        if not cano:
+            continue
+        label = ent.get("label") or "MODEL"
+        cano_meta[cano] = {
+            "label": label,
+            "category": ent.get("category"),
+            "url": ent.get("url"),
+        }
+        # Canonical + alias
+        variants = [cano] + list(ent.get("aliases", []) or [])
+        patterns = []
+        for a in variants:
+            a = (a or "").strip()
+            if not a:
                 continue
-            label = ent.get("label") or "MODEL"
-            aliases = {cano}
-            for a in ent.get("aliases", []) or []:
-                a = (a or "").strip()
-                if a:
-                    aliases.add(a)
-
-            self._label_by_cano[cano] = label
-            self._aliases_by_cano[cano] = sorted(aliases, key=len, reverse=True)
-
-            for a in aliases:
-                self._lexicon.append(a)
-                self._cano_by_alias_low[a.lower()] = cano
-
-        # dédoublonner
-        self._lexicon = list(dict.fromkeys(self._lexicon))
-
-    def _build_phrase_matcher(self) -> None:
-        pm = PhraseMatcher(self.nlp.vocab, attr="LOWER")
-        for cano, aliases in self._aliases_by_cano.items():
-            if not aliases:
-                continue
-            patterns = [self.nlp.make_doc(a) for a in aliases]
+            alias_to_cano[a.lower()] = cano
+            all_aliases.append(a)
+            patterns.append(nlp.make_doc(a))
+        if patterns:
             pm.add(f"CANO::{cano}", patterns)
-        self._pm = pm
 
-    # ---------- extraction ----------
-    def extract(self, text: str) -> List[EntityMatch]:
-        if not text:
-            return []
-        doc = self.nlp.make_doc(text)
-        out: List[EntityMatch] = []
+    # Dédoublonnage de la liste d'alias brute (utile pour RapidFuzz)
+    all_aliases = list(dict.fromkeys(all_aliases))
+    return pm, alias_to_cano, cano_meta, all_aliases
 
-        # 1) Exact (PhraseMatcher)
-        if self._pm:
-            for match_id, start, end in self._pm(doc):
-                rule = self.nlp.vocab.strings[match_id]
-                cano = rule.split("::", 1)[1] if "::" in rule else None
-                span = doc[start:end]
-                if not cano or not span.text.strip():
-                    continue
-                label = self._label_by_cano.get(cano, "MODEL")
-                out.append(EntityMatch(
-                    text=span.text,
-                    start=span.start_char,
-                    end=span.end_char,
-                    label=label,
-                    canonical=cano,
-                    method="exact",
-                    score=1.0,
-                ))
 
-        # 2) Fuzzy global (message entier)
-        if self.enable_fuzzy and self.has_rapidfuzz:
-            out.extend(self._fuzzy_full_message(text))
-
-        # Déduplication basique
-        out = self._dedupe_overlaps(out)
-        return sorted(out, key=lambda m: (m.start, -m.end))
-
-    def _fuzzy_full_message(self, text: str) -> List[EntityMatch]:
-        from rapidfuzz import process, fuzz  # type: ignore
-
-        s = (text or "").strip()
-        if not s:
-            return []
-
-        results = process.extract(
-            s,
-            self._lexicon,
-            scorer=fuzz.partial_ratio,
-            score_cutoff=self.fuzzy_threshold,
-            limit=5
-        )
-
-        out: List[EntityMatch] = []
-        for alias, score, _ in results:
-            cano = self._cano_by_alias_low.get(alias.lower())
+# ================= Fuzzy scoring (WRatio) =================
+def compute_wratio_scores(user_text: str,
+                          aliases: List[str],
+                          alias_to_cano: Dict[str, str]) -> List[Dict]:
+    """
+    Calcule un score WRatio pour CHAQUE alias (puis agrège au niveau canonique
+    en prenant le meilleur alias). Retourne une liste de dicts triée par score desc :
+    [{canonical, best_alias, score}]
+    """
+    if not RAPIDFUZZ_OK or not user_text.strip():
+        # Pas de RF ou texte vide -> scores 0
+        best_by_cano: Dict[str, Dict] = {}
+        for al in aliases:
+            cano = alias_to_cano.get(al.lower(), "")
             if not cano:
                 continue
-            label = self._label_by_cano.get(cano, "MODEL")
+            cur = best_by_cano.get(cano)
+            if cur is None or 0 > cur["score"]:
+                best_by_cano[cano] = {"canonical": cano, "best_alias": al, "score": 0}
+        return sorted(best_by_cano.values(), key=lambda d: (-d["score"], d["canonical"]))
 
-            # Localisation best-effort (pour surlignage) : recherche naïve (sans regex)
-            s_low = s.lower()
-            a_low = alias.lower()
-            pos = s_low.find(a_low)
-            if pos >= 0:
-                start, end = pos, pos + len(alias)
-                shown = text[start:end]
-            else:
-                # si l'alias n'apparaît pas littéralement (cas fuzzy), on met tout le message
-                start, end = 0, len(text)
-                shown = text
+    # 1) scores alias-level
+    results = process.extract(
+        user_text,
+        aliases,
+        scorer=fuzz.WRatio,   # même scorer que dans ton snippet
+        limit=len(aliases)
+    )
+    # results: List[Tuple[alias, score, idx]]
 
-            out.append(EntityMatch(
-                text=shown,
-                start=start,
-                end=end,
-                label=label,
-                canonical=cano,
-                method="fuzzy",
-                score=max(0.0, min(1.0, float(score) / 100.0)),
-            ))
-        return out
+    # 2) agrégation par canonique (meilleur alias)
+    best_by_cano: Dict[str, Dict] = {}
+    for alias, score, _ in results:
+        cano = alias_to_cano.get(alias.lower())
+        if not cano:
+            continue
+        cur = best_by_cano.get(cano)
+        if cur is None or score > cur["score"]:
+            best_by_cano[cano] = {"canonical": cano, "best_alias": alias, "score": float(score)}
 
-    @staticmethod
-    def _dedupe_overlaps(items: List[EntityMatch]) -> List[EntityMatch]:
-        if not items:
-            return []
-        # Priorité : exact > meilleur score > span le plus long
-        items = sorted(items, key=lambda m: (0 if m.method == "exact" else 1, -(m.score), -(m.end - m.start)))
-        kept: List[EntityMatch] = []
-        occupied: List[Tuple[int, int]] = []
-
-        def overlap(a: Tuple[int, int], b: Tuple[int, int]) -> bool:
-            return not (a[1] <= b[0] or b[1] <= a[0])
-
-        for m in items:
-            span = (m.start, m.end)
-            if any(overlap(span, o) for o in occupied):
-                continue
-            kept.append(m)
-            occupied.append(span)
-        return kept
+    # Tri score desc puis nom canonique
+    return sorted(best_by_cano.values(), key=lambda d: (-d["score"], d["canonical"]))
 
 
-# ============== UI helpers ==============
+# ================= Highlight exact matches =================
 def highlight_html(text: str, matches: List[EntityMatch]) -> str:
     if not text:
         return ""
@@ -248,7 +179,7 @@ def highlight_html(text: str, matches: List[EntityMatch]) -> str:
     for m in spans:
         if m.start > cur:
             out.append(html.escape(text[cur:m.start]))
-        title = f"{m.label} → {m.canonical} ({m.method}, {int(m.score*100)}%)"
+        title = f"{m.label} → {m.canonical} (exact)"
         out.append(
             f"<mark style='background-color:#fff3cd; padding:0 2px; border-radius:2px' "
             f"title='{html.escape(title)}'>{html.escape(text[m.start:m.end])}</mark>"
@@ -259,109 +190,141 @@ def highlight_html(text: str, matches: List[EntityMatch]) -> str:
     return "".join(out)
 
 
-def assistant_reply_from_entities(matches: List[EntityMatch]) -> str:
-    if not matches:
-        return "Je n’ai pas reconnu de modèle. Indiquez le nom exact (ou activez un mode fuzzy) ?"
-    canos = list(dict((m.canonical, None) for m in matches).keys())
-    if len(canos) == 1:
-        return f"Modèle détecté : {canos[0]}"
-    return "Modèles détectés : " + ", ".join(canos)
+def exact_spans(nlp, pm, text: str, cano_meta: Dict[str, Dict]) -> List[EntityMatch]:
+    if not text:
+        return []
+    doc = nlp.make_doc(text)
+    out: List[EntityMatch] = []
+    for match_id, start, end in pm(doc):
+        rule = nlp.vocab.strings[match_id]  # "CANO::<canonical>"
+        cano = rule.split("::", 1)[1] if "::" in rule else None
+        span = doc[start:end]
+        if not cano or not span.text.strip():
+            continue
+        label = (cano_meta.get(cano) or {}).get("label", "MODEL")
+        out.append(
+            EntityMatch(
+                text=span.text,
+                start=span.start_char,
+                end=span.end_char,
+                label=label,
+                canonical=cano,
+                method="exact",
+                score=1.0,
+            )
+        )
+    return out
 
 
-# ============== Session ==============
-if "pipeline" not in st.session_state:
-    st.session_state.pipeline = NERPipeline(DATA_PATH)
-pipeline: NERPipeline = st.session_state.pipeline
+# ================= Main UI =================
+st.title("Chat NER (Salomon) + Scores RapidFuzz (WRatio)")
+st.caption("• NER exact (PhraseMatcher) pour surligner le texte • Scores fuzzy pour tous les modèles (WRatio)")
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "mode_prev" not in st.session_state:
-    st.session_state.mode_prev = pipeline.fuzzy_preset
-if "mode_changed" not in st.session_state:
-    st.session_state.mode_changed = False
+# Charge modèles + matcher
+nlp = load_nlp()
+data = load_entities(DATA_PATH)
+pm, alias_to_cano, cano_meta, all_aliases = build_phrase_matcher(nlp, data)
 
+# État de conversation minimal
+if "history" not in st.session_state:
+    st.session_state.history = []  # [{role, content, entities}]
+if "last_scores" not in st.session_state:
+    st.session_state.last_scores = []  # scores du dernier input
 
-# ============== Sidebar (3 modes) ==============
-st.sidebar.header("Paramètres")
+# Avertissements utiles
+if not RAPIDFUZZ_OK:
+    st.info("RapidFuzz n'est pas installé : les scores fuzzy seront à 0. Ajoute `rapidfuzz` dans requirements.txt.")
 
-rf_ok = getattr(pipeline, "has_rapidfuzz", False)
-labels = {"off": "Désactivé", "balanced": "Équilibré", "aggressive": "Agressif"}
-current = st.session_state.mode_prev if rf_ok else "off"
-
-selected = st.sidebar.radio(
-    "Mode de correspondance",
-    options=list(labels.keys()),
-    index=list(labels.keys()).index(current),
-    format_func=lambda k: labels[k],
-)
-
-# Appliquer et marquer le changement (pas de st.rerun)
-if selected != st.session_state.mode_prev:
-    pipeline.set_fuzzy_preset(selected)
-    st.session_state.mode_prev = selected
-    st.session_state.mode_changed = True
-else:
-    st.session_state.mode_changed = False
-
-st.sidebar.markdown(
-    """
-**Modes**  
-- **Désactivé** : dictionnaire exact seulement.  
-- **Équilibré** : ajoute fuzzy (`partial_ratio ≥ 88`).  
-- **Agressif** : fuzzy plus tolérant (`partial_ratio ≥ 82`).  
-"""
-)
-
-with st.sidebar.expander("Diagnostic"):
-    st.write(f"RapidFuzz : **{'oui' if rf_ok else 'non'}**")
-    st.write(f"Modèles chargés : **{len(pipeline._aliases_by_cano)}**")
-    st.write(f"Alias chargés : **{len(pipeline._lexicon)}**")
-    if not rf_ok and selected != "off":
-        st.info("RapidFuzz indisponible : le fuzzy est inactif (mode effectif = Désactivé).")
-
-
-# ============== Main ==============
-st.title("Chatbot NER + Fuzzy (Salomon)")
-
-# Historique
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        if msg["role"] == "user" and msg.get("entities"):
-            st.markdown(highlight_html(msg["content"], msg["entities"]), unsafe_allow_html=True)
-        else:
-            st.write(msg["content"])
-
-# Ré-analyse auto si le mode a changé
-if st.session_state.mode_changed:
-    last_user = next((m for m in reversed(st.session_state.messages) if m["role"] == "user"), None)
-    if last_user:
-        ents = pipeline.extract(last_user["content"])
-        reply = "(Analyse mise à jour — mode " + labels[selected] + ") " + assistant_reply_from_entities(ents)
-        st.session_state.messages.append({"role": "assistant", "content": reply, "entities": []})
-
-# Saisie
 with st.form("chat_form"):
-    user_text = st.text_input("Votre message", value="")
+    user_text = st.text_input("Votre message", value="", help="Ex: 'Je cherche la speedcross6 pour terrain boueux'")
     sent = st.form_submit_button("Envoyer")
 
 if st.button("Vider la conversation"):
-    st.session_state.messages = []
+    st.session_state.history = []
+    st.session_state.last_scores = []
 
+# Au submit : NER exact + scores fuzzy
 if sent and user_text.strip():
     text = user_text.strip()
-    ents = pipeline.extract(text)
-    st.session_state.messages.append({"role": "user", "content": text, "entities": ents})
-    with st.chat_message("user"):
-        st.markdown(highlight_html(text, ents), unsafe_allow_html=True)
+    # 1) Exact spans (pour surlignage)
+    ents = exact_spans(nlp, pm, text, cano_meta)
+    st.session_state.history.append({"role": "user", "content": text, "entities": ents})
 
-    reply = assistant_reply_from_entities(ents)
-    st.session_state.messages.append({"role": "assistant", "content": reply, "entities": []})
+    # 2) Scores WRatio pour TOUS les modèles (meilleur alias par canonique)
+    scores = compute_wratio_scores(text, all_aliases, alias_to_cano)
+    st.session_state.last_scores = scores
 
-# Inspector
-with st.expander("Inspector"):
-    last_user = next((m for m in reversed(st.session_state.messages) if m["role"] == "user"), None)
-    if last_user and last_user.get("entities"):
-        rows = [m.to_dict() for m in last_user["entities"]]
-        st.dataframe(rows, use_container_width=True)
+# Affichage de l'historique (surlignage exact)
+for msg in st.session_state.history:
+    with st.chat_message(msg["role"]):
+        if msg["role"] == "user":
+            st.markdown(highlight_html(msg["content"], msg.get("entities", [])), unsafe_allow_html=True)
+        else:
+            st.write(msg["content"])
+
+# Tableau des scores pour TOUS les modèles (à jour du dernier message)
+st.subheader("Scores de correspondance (WRatio) — Tous les modèles")
+if st.session_state.last_scores:
+    # enrichir avec meta (label / category / url)
+    rows = []
+    for item in st.session_state.last_scores:
+        meta = cano_meta.get(item["canonical"], {})
+        rows.append({
+            "Modèle (canonical)": item["canonical"],
+            "Alias (meilleur)": item["best_alias"],
+            "Score": round(item["score"], 3),
+            "Label": meta.get("label"),
+            "Catégorie": meta.get("category"),
+            "URL": meta.get("url"),
+        })
+    # tri par score desc
+    rows = sorted(rows, key=lambda r: (-r["Score"], r["Modèle (canonical)"]))
+    st.dataframe(rows, use_container_width=True)
+else:
+    st.info("Tape un message puis clique sur Envoyer pour calculer les scores.")
+
+# Petit top-5 pratique (lecture rapide)
+if st.session_state.last_scores:
+    st.markdown("**Top 5**")
+    top5 = st.session_state.last_scores[:5]
+    for r in top5:
+        st.write(f"- {r['canonical']}  —  alias: “{r['best_alias']}”  —  score: {r['score']:.3f}")
+
+# Démo RapidFuzz "companies" (ton snippet)
+with st.expander("Exemple RapidFuzz (companies + WRatio)"):
+    st.code(
+        """from rapidfuzz import process, fuzz
+
+companies = [
+    "Apple Inc.",
+    "Apple Incorporated",
+    "APPLE INC",
+    "Microsoft Corporation",
+    "Microsoft Corp.",
+    "Google LLC",
+    "Alphabet Inc.",
+]
+
+matches = process.extract("apple incorporated", companies, scorer=fuzz.WRatio, limit=2)
+
+print("Best matches:")
+for match in matches:
+    print(f"Match: {match[0]}, Score: {match[1]:.3f}")""",
+        language="python",
+    )
+    if RAPIDFUZZ_OK:
+        companies = [
+            "Apple Inc.",
+            "Apple Incorporated",
+            "APPLE INC",
+            "Microsoft Corporation",
+            "Microsoft Corp.",
+            "Google LLC",
+            "Alphabet Inc.",
+        ]
+        demo = process.extract("apple incorporated", companies, scorer=fuzz.WRatio, limit=2)
+        st.write("**Best matches:**")
+        for alias, score, _ in demo:
+            st.write(f"- Match: {alias}, Score: {score:.3f}")
     else:
-        st.info("Envoyez un message pour voir les entités détectées.")
+        st.warning("RapidFuzz non disponible — impossible d'exécuter la démo.")
