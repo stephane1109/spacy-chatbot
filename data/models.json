@@ -2,24 +2,74 @@
   "entities": [
     {
       "canonical": "Salomon Speedcross 6",
-      "aliases": ["Speedcross 6", "speedcross6", "speed cross 6"],
+      "aliases": ["Speedcross 6", "speed cross 6", "speedcross6", "SPEEDCROSS 6"],
       "label": "MODEL",
       "category": "trail",
-      "url": "https://www.salomon.com/fr-fr/shop-emea/product/speedcross-6.html"
+      "url": "https://www.salomon.com/en-us/product/speedcross-6-lg9212"
     },
     {
-      "canonical": "Salomon X Ultra 4",
-      "aliases": ["X Ultra 4", "x-ultra-4", "xultra4", "X ULTRA4"],
+      "canonical": "Salomon Speedcross 6 GORE-TEX",
+      "aliases": ["Speedcross 6 GTX", "Speedcross 6 Gore-Tex", "SPEEDCROSS 6 GTX", "speedcross6 gtx"],
       "label": "MODEL",
-      "category": "hiking",
-      "url": "https://www.salomon.com/fr-fr/shop-emea/product/x-ultra-4.html"
+      "category": "trail",
+      "url": "https://www.salomon.com/en-us/product/speedcross-6-gore-tex-lg9214"
     },
     {
       "canonical": "Salomon Sense Ride 5",
-      "aliases": ["Sense Ride 5", "senseride5", "sense-ride-5"],
+      "aliases": ["Sense Ride 5", "senseride5", "sense-ride-5", "SENSE RIDE 5"],
       "label": "MODEL",
       "category": "trail",
-      "url": "https://www.salomon.com/fr-fr/shop-emea/product/sense-ride-5.html"
+      "url": "https://www.salomon.com/en-us/product/sense-ride-5-li3122"
+    },
+    {
+      "canonical": "Salomon Sense Ride 5 SR",
+      "aliases": ["Sense Ride 5 SR", "Sense Ride SR", "SENSE RIDE 5 SR"],
+      "label": "MODEL",
+      "category": "trail",
+      "url": "https://www.salomon.com/en-us/product/sense-ride-5-sr-li5592"
+    },
+    {
+      "canonical": "Salomon Sense Ride 5 SR Leather",
+      "aliases": ["Sense Ride 5 SR Leather", "Sense Ride 5 SR LE", "SENSE RIDE 5 SR LEATHER"],
+      "label": "MODEL",
+      "category": "trail",
+      "url": "https://www.salomon.com/en-us/product/sense-ride-5-sr-leather-li6156"
+    },
+    {
+      "canonical": "Salomon X Ultra 4 GORE-TEX",
+      "aliases": ["X Ultra 4 GTX", "X-Ultra 4 GTX", "x ultra 4 gtx", "x-ultra-4 gtx"],
+      "label": "MODEL",
+      "category": "hiking",
+      "url": "https://www.salomon.com/en-gb/shop-emea/product/x-ultra-4-gtx-w.html"
+    },
+    {
+      "canonical": "Salomon X Ultra 4 Mid Wide GORE-TEX",
+      "aliases": ["X Ultra 4 Mid Wide GTX", "X-Ultra 4 Mid Wide GTX", "x ultra 4 mid wide gtx"],
+      "label": "MODEL",
+      "category": "hiking",
+      "url": "https://www.salomon.com/en-gb/product/x-ultra-4-mid-wide-gore-tex-lg3748"
+    },
+    {
+      "canonical": "Salomon X Ultra Alpine Mid GORE-TEX",
+      "aliases": ["X Ultra Alpine Mid GTX", "x ultra alpine mid gtx", "X-ULTRA Alpine Mid GTX"],
+      "label": "MODEL",
+      "category": "hiking",
+      "url": "https://www.salomon.com/en-us/product/x-ultra-alpine-mid-gore-tex-li5959"
+    },
+    {
+      "canonical": "Salomon X Ultra Tracker GORE-TEX",
+      "aliases": ["X Ultra Tracker GTX", "x ultra tracker gtx"],
+      "label": "MODEL",
+      "category": "hiking",
+      "url": "https://www.salomon.com/en-us/product/x-ultra-tracker-gore-tex-li6401"
+    },
+    {
+      "canonical": "Salomon Speedcross 6 FORCES",
+      "aliases": ["Speedcross 6 Forces", "SPEEDCROSS 6 FORCES"],
+      "label": "MODEL",
+      "category": "trail",
+      "url": "https://www.salomon.com/en-us/product/speedcross-6-forces-li4275"
     }
   ]
 }
+
