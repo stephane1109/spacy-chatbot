@@ -6,14 +6,16 @@ from typing import List, Dict
 from dataclasses import dataclass, asdict
 import json
 import html
+import re
+import unicodedata
 
 import streamlit as st
 import spacy
 from spacy.matcher import PhraseMatcher
 
-# RapidFuzz (scores WRatio)
+# RapidFuzz
 try:
-    from rapidfuzz import process, fuzz  # type: ignore
+    from rapidfuzz import fuzz  # type: ignore
     RAPIDFUZZ_OK = True
 except Exception:
     RAPIDFUZZ_OK = False
@@ -25,7 +27,7 @@ ROOT = Path(__file__).parent
 DATA_PATH = ROOT / "data" / "models.json"
 
 
-# ================= Data models =================
+# ================= Data model =================
 @dataclass
 class EntityMatch:
     text: str
@@ -42,7 +44,31 @@ class EntityMatch:
         return d
 
 
-# ================= Loaders (cache sûrs) =================
+# ================= Helpers: normalisation pour le fuzzy =================
+STOPWORDS_NOISE = {
+    "salomon", "chaussure", "chaussures", "modele", "modèle", "modeles", "modèles",
+    "je", "voudrais", "veux", "souhaite", "infos", "information", "informations",
+    "sur", "pour", "des", "de", "du", "la", "le", "les", "un", "une", "et", "à", "a",
+}
+
+def normalize(s: str) -> str:
+    if not s:
+        return ""
+    # retire accents
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = s.lower()
+    # garder alphanum -> espaces
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    # retirer mots bruit
+    tokens = [t for t in s.split() if t and t not in STOPWORDS_NOISE]
+    s = " ".join(tokens)
+    # compact
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+# ================= Loaders (cachés) =================
 @st.cache_resource(show_spinner=False)
 def load_nlp():
     try:
@@ -59,7 +85,7 @@ def load_entities(path_str: str) -> Dict:
             return data
     except Exception:
         pass
-    # Fallback si le JSON n'est pas dispo (exemples Salomon)
+    # fallback d’exemple si le JSON n’est pas dispo
     return {
         "entities": [
             {
@@ -89,7 +115,7 @@ def load_entities(path_str: str) -> Dict:
 @st.cache_resource(show_spinner=False)
 def build_phrase_matcher_from_json(entities_json: str):
     """
-    Construit PhraseMatcher à partir d'une chaîne JSON (hashable pour le cache).
+    Construit PhraseMatcher à partir d’une chaîne JSON (hashable pour le cache).
     """
     nlp = load_nlp()
     data = json.loads(entities_json)
@@ -125,7 +151,7 @@ def build_phrase_matcher_from_json(entities_json: str):
     return pm, alias_to_cano, cano_meta, all_aliases
 
 
-# ================= Exact + WRatio =================
+# ================= Exact (surlignage) =================
 def exact_spans(nlp, pm, text: str, cano_meta: Dict[str, Dict]) -> List[EntityMatch]:
     if not text:
         return []
@@ -152,39 +178,63 @@ def exact_spans(nlp, pm, text: str, cano_meta: Dict[str, Dict]) -> List[EntityMa
     return out
 
 
-def compute_wratio_scores(user_text: str,
-                          aliases: List[str],
-                          alias_to_cano: Dict[str, str]) -> List[Dict]:
+# ================= Fuzzy ensemble (message entier) =================
+def compute_fuzzy_scores_ensemble(user_text: str,
+                                  aliases: List[str],
+                                  alias_to_cano: Dict[str, str]) -> List[Dict]:
     """
-    Score WRatio pour chaque alias, agrégé au niveau canonique (meilleur alias).
-    Retourne [{canonical, best_alias, score}] trié desc.
+    Pour chaque alias, calcule un score via trois scoreurs :
+      - partial_ratio
+      - partial_token_set_ratio
+      - token_sort_ratio
+    sur TEXTE et ALIAS **normalisés**, puis prend le max.
+    On agrège ensuite au niveau du canonical (meilleur alias).
+    Retourne [{canonical, best_alias, score, scorer}] trié desc.
     """
-    if not user_text.strip() or not RAPIDFUZZ_OK:
+    # Si RF absent, tout à 0
+    if not RAPIDFUZZ_OK:
         best_by_cano: Dict[str, Dict] = {}
         for al in aliases:
-            cano = alias_to_cano.get(al.lower(), "")
+            cano = alias_to_cano.get(al.lower())
             if not cano:
                 continue
             cur = best_by_cano.get(cano)
             if cur is None or 0 > cur["score"]:
-                best_by_cano[cano] = {"canonical": cano, "best_alias": al, "score": 0.0}
+                best_by_cano[cano] = {"canonical": cano, "best_alias": al, "score": 0.0, "scorer": "n/a"}
         return sorted(best_by_cano.values(), key=lambda d: (-d["score"], d["canonical"]))
 
-    results = process.extract(
-        user_text,
-        aliases,
-        scorer=fuzz.WRatio,    # on garde WRatio (pas de correctif 100%)
-        limit=len(aliases)
-    )
+    s = normalize(user_text)
+    if not s:
+        # texte vide après normalisation
+        best_by_cano: Dict[str, Dict] = {}
+        for al in aliases:
+            cano = alias_to_cano.get(al.lower())
+            if cano and cano not in best_by_cano:
+                best_by_cano[cano] = {"canonical": cano, "best_alias": al, "score": 0.0, "scorer": "n/a"}
+        return sorted(best_by_cano.values(), key=lambda d: (-d["score"], d["canonical"]))
 
     best_by_cano: Dict[str, Dict] = {}
-    for alias, score, _ in results:
+    for alias in aliases:
         cano = alias_to_cano.get(alias.lower())
         if not cano:
             continue
+        a = normalize(alias)
+        # max de trois scoreurs
+        cand = [
+            ("partial_ratio", fuzz.partial_ratio(s, a)),
+            ("partial_token_set_ratio", fuzz.partial_token_set_ratio(s, a)),
+            ("token_sort_ratio", fuzz.token_sort_ratio(s, a)),
+        ]
+        scorer_name, score_val = max(cand, key=lambda x: x[1])
+
         cur = best_by_cano.get(cano)
-        if cur is None or score > cur["score"]:
-            best_by_cano[cano] = {"canonical": cano, "best_alias": alias, "score": float(score)}
+        if cur is None or score_val > cur["score"]:
+            best_by_cano[cano] = {
+                "canonical": cano,
+                "best_alias": alias,
+                "score": float(score_val),
+                "scorer": scorer_name,
+            }
 
     return sorted(best_by_cano.values(), key=lambda d: (-d["score"], d["canonical"]))
 
@@ -214,40 +264,30 @@ def build_assistant_reply(user_text: str,
                           exact_entities: List[EntityMatch],
                           scores: List[Dict],
                           cano_meta: Dict[str, Dict]) -> str:
-    """
-    Réponse simple :
-    - Si exact → on confirme le(s) modèle(s) trouvé(s).
-    - Sinon → on propose le meilleur candidat WRatio (si score >= 80), avec score affiché.
-    """
     if exact_entities:
         canos = list(dict((m.canonical, None) for m in exact_entities).keys())
         if len(canos) == 1:
             cano = canos[0]
-            meta = cano_meta.get(cano, {})
-            url = meta.get("url")
+            url = (cano_meta.get(cano) or {}).get("url")
             base = f"Modèle détecté : {cano}."
             return base + (f" Fiche produit : {url}" if url else "")
-        else:
-            lines = [f"- {c}" for c in canos]
-            return "Modèles détectés :\n" + "\n".join(lines)
+        return "Modèles détectés : " + ", ".join(canos)
 
-    # Pas d'exact → proposer le top fuzzy si suffisamment haut
     if scores:
         top = scores[0]
-        if top["score"] >= 80:
+        if top["score"] >= 75:  # seuil raisonnable après normalisation
             cano = top["canonical"]
-            meta = cano_meta.get(cano, {})
-            url = meta.get("url")
-            ans = f"Je suppose que vous parlez de « {cano} » (score WRatio {top['score']:.0f})."
+            url = (cano_meta.get(cano) or {}).get("url")
+            ans = f"Je pense que vous parlez de « {cano} » (score {top['score']:.0f}, {top['scorer']})."
             return ans + (f" Fiche produit : {url}" if url else "")
-    return "Je n’ai pas reconnu de modèle. Donnez le nom exact ou une variante proche."
+    return "Je n’ai pas reconnu de modèle. Donnez le nom exact (ou une variante proche)."
 
 
 # ================= Main UI =================
-st.title("Chat NER (Salomon) + Scores (WRatio)")
-st.caption("• NER exact (PhraseMatcher) • Tableau des scores WRatio pour tous les modèles • Réponse chatbot après chaque requête")
+st.title("Chat NER (Salomon) + Scores fuzzy")
+st.caption("• NER exact (PhraseMatcher) • Scores fuzzy (ensemble) pour tous les modèles • Réponse chatbot")
 
-# Charge modèles + matcher (via caches sûrs)
+# Charger modèles + matcher (via caches sûrs)
 nlp = load_nlp()
 entities_data = load_entities(str(DATA_PATH))
 entities_json = json.dumps(entities_data, sort_keys=True, ensure_ascii=False)
@@ -260,11 +300,11 @@ if "last_scores" not in st.session_state:
     st.session_state.last_scores = []
 
 if not RAPIDFUZZ_OK:
-    st.info("RapidFuzz n'est pas installé : les scores WRatio seront à 0. Ajoute `rapidfuzz` au requirements.txt.")
+    st.info("RapidFuzz n'est pas installé : les scores seront à 0. Ajoute `rapidfuzz` dans requirements.txt.")
 
 # Formulaire
 with st.form("chat_form"):
-    user_text = st.text_input("Votre message", value="", help="Ex: 'Je voudrais des infos sur la Speedcross 6'")
+    user_text = st.text_input("Votre message", value="", help="Ex: 'je veux des infos sur la chaussure sped cros'")
     sent = st.form_submit_button("Envoyer")
 
 if st.button("Vider la conversation"):
@@ -275,12 +315,12 @@ if st.button("Vider la conversation"):
 if sent and user_text.strip():
     text = user_text.strip()
 
-    # 1) Exact pour surlignage
+    # 1) NER exact (surlignage si alias exact présent)
     ents = exact_spans(nlp, pm, text, cano_meta)
     st.session_state.history.append({"role": "user", "content": text, "entities": ents})
 
-    # 2) Scores WRatio (tous les modèles)
-    scores = compute_wratio_scores(text, all_aliases, alias_to_cano)
+    # 2) Fuzzy ensemble (scores pour TOUS les modèles)
+    scores = compute_fuzzy_scores_ensemble(text, all_aliases, alias_to_cano)
     st.session_state.last_scores = scores
 
     # 3) Réponse chatbot
@@ -296,7 +336,7 @@ for msg in st.session_state.history:
             st.write(msg["content"])
 
 # Tableau des scores (tous les modèles)
-st.subheader("Scores de correspondance (WRatio) — Tous les modèles")
+st.subheader("Scores de correspondance — Tous les modèles")
 if st.session_state.last_scores:
     rows = []
     for item in st.session_state.last_scores:
@@ -304,7 +344,8 @@ if st.session_state.last_scores:
         rows.append({
             "Modèle (canonical)": item["canonical"],
             "Alias (meilleur)": item["best_alias"],
-            "Score": round(item["score"], 3),
+            "Score": round(item["score"], 1),
+            "Scorer": item["scorer"],
             "Label": meta.get("label"),
             "Catégorie": meta.get("category"),
             "URL": meta.get("url"),
