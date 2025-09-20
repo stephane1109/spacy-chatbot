@@ -1,70 +1,25 @@
 {
-  "brand": "Salomon",
   "entities": [
     {
-      "label": "MODEL",
       "canonical": "Salomon Speedcross 6",
+      "aliases": ["Speedcross 6", "speedcross6", "speed cross 6"],
+      "label": "MODEL",
       "category": "trail",
-      "url": "https://www.salomon.com/fr-fr/shop-emea/product/speedcross-6.html",
-      "synonyms": [
-        "speedcross 6",
-        "speed cross 6",
-        "speedcross6",
-        "sc6",
-        "speed cross",
-        "speedcross"
-      ]
+      "url": "https://www.salomon.com/fr-fr/shop-emea/product/speedcross-6.html"
     },
     {
-      "label": "MODEL",
       "canonical": "Salomon X Ultra 4",
+      "aliases": ["X Ultra 4", "x-ultra-4", "xultra4", "X ULTRA4"],
+      "label": "MODEL",
       "category": "hiking",
-      "url": "https://www.salomon.com/fr-fr/shop-emea/product/x-ultra-4.html",
-      "synonyms": [
-        "x ultra 4",
-        "x-ultra 4",
-        "xultra 4",
-        "xultra",
-        "x ultra",
-        "x-ultra"
-      ]
+      "url": "https://www.salomon.com/fr-fr/shop-emea/product/x-ultra-4.html"
     },
     {
-      "label": "MODEL",
-      "canonical": "Salomon XA Pro 3D",
-      "category": "trail",
-      "url": "https://www.salomon.com/fr-fr/shop-emea/product/xa-pro-3d.html",
-      "synonyms": [
-        "xa pro 3d",
-        "xa pro",
-        "xa-pro 3d",
-        "xapro",
-        "xa pro3d"
-      ]
-    },
-    {
-      "label": "MODEL",
       "canonical": "Salomon Sense Ride 5",
-      "category": "trail",
-      "url": "https://www.salomon.com/fr-fr/shop-emea/product/sense-ride-5.html",
-      "synonyms": [
-        "sense ride 5",
-        "sense ride",
-        "senseride 5",
-        "senseride"
-      ]
-    },
-    {
+      "aliases": ["Sense Ride 5", "senseride5", "sense-ride-5"],
       "label": "MODEL",
-      "canonical": "Salomon Supercross 4",
       "category": "trail",
-      "url": "https://www.salomon.com/fr-fr/shop-emea/product/supercross-4.html",
-      "synonyms": [
-        "supercross 4",
-        "super cross 4",
-        "supercross4",
-        "sc4"
-      ]
+      "url": "https://www.salomon.com/fr-fr/shop-emea/product/sense-ride-5.html"
     }
   ]
 }
