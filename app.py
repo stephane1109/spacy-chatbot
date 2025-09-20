@@ -20,7 +20,7 @@ except Exception:
 
 
 # ============== Config ==============
-st.set_page_config(page_title="Salomon NER • Scores WRatio")  # pas de wide
+st.set_page_config(page_title="Chatbot NER • Scores WRatio")  # pas de wide
 RACINE = Path(__file__).parent
 # CHEMIN_JSON = RACINE / "data" / "models.json"
 CHEMIN_JSON = RACINE / "data" / "models_couserans.json"
@@ -242,7 +242,7 @@ def construire_reponse_assistant(texte: str,
 
 
 # ============== Interface principale ==============
-st.title("Chat NER (Salomon) + Scores WRatio")
+st.title("Chatbot basé sur des Names Entity Recognition + Matcher FUZZY WRatio")
 st.caption("• NER exact (PhraseMatcher) • Scores WRatio pour tous les modèles • Réponse après chaque requête")
 
 # ---- Contrôle du seuil de suggestion (UI) ----
