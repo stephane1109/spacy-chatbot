@@ -1,42 +1,29 @@
 from __future__ import annotations
-
-# =============================================================================
-# Couserans — Lacs & Étangs (fuzzy avec modes de score + toponymes + fragments)
-# =============================================================================
-
 from pathlib import Path
 from typing import List, Dict
 import json
-import re
-
 import streamlit as st
 
-# RapidFuzz (équivalent FuzzyWuzzy) : plusieurs scoreurs disponibles
+# RapidFuzz = moteur de similarité (équivalent FuzzyWuzzy) : on n'utilise que WRatio
 try:
     from rapidfuzz import process, fuzz  # type: ignore
     RAPIDFUZZ_OK = True
 except Exception:
     RAPIDFUZZ_OK = False
 
-# ---------------- Config ----------------
-st.set_page_config(page_title="Couserans • Lacs & Étangs (Fuzzy)")
-RACINE = Path(__file__).parent
-CHEMIN_JSON = RACINE / "data" / "models_couserans.json"
+# ---------------------- Config ----------------------
+st.set_page_config(page_title="Couserans • Lacs & Étangs (WRatio + aliases, insensible à la casse)")  # pas de wide
+ROOT = Path(__file__).parent
+JSON_PATH = ROOT / "data" / "models_couserans.json"
 
-# Règles de boost
-BOOST_TOPONYME = 30.0    # si un toponyme distinctif complet est présent (mot entier)
-BOOST_PREFIXE = 40.0     # si la requête est le début d’un toponyme (ex. "beth" => "Bethmale")
-
-# Mots génériques à ignorer pour construire les toponymes
-MOTS_GENERIQUES = {
-    "lac", "lacs", "étang", "etang", "étangs", "etangs",
-    "de", "du", "des", "la", "le", "les", "l", "d"
-}
-
-# --------------- Chargement JSON ---------------
+# ---------------------- Chargement JSON (caché) ----------------------
 @st.cache_resource(show_spinner=False)
-def lire_json_entites(chemin_str: str) -> dict | None:
-    p = Path(chemin_str)
+def load_entities(path_str: str) -> dict | None:
+    """
+    Lit le JSON des lacs/étangs.
+    Format attendu: {"entities":[{"canonical":..., "aliases":[...], "label":..., "category":..., "url":...}, ...]}
+    """
+    p = Path(path_str)
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
         if isinstance(data, dict) and isinstance(data.get("entities"), list):
@@ -46,282 +33,218 @@ def lire_json_entites(chemin_str: str) -> dict | None:
     return None
 
 @st.cache_resource(show_spinner=False)
-def construire_index_depuis_json(entites_json: str):
+def build_index(entities_json_str: str):
     """
-    Produit :
-      - alias_vers_canonique : alias.lower() -> canonical
-      - meta_par_canonique   : infos (label, category, url)
-      - tous_alias           : liste de tous les alias (canonical + aliases)
-      - noms_principaux      : liste des canonical (pour l’aide sous le titre)
-      - tokens_par_canonique : {canonical: set de tokens (mots) issus canonical+aliases}
+    Construit les structures pour le matching (case-insensitive) :
+      - alias_to_cano      : alias_lower -> canonical
+      - orig_by_lower      : alias_lower -> alias tel qu'il apparaît (pour l'affichage)
+      - meta_by_cano       : {canonical: {label, category, url}}
+      - all_aliases_lower  : liste plate des alias en minuscules (corpus de recherche)
+      - examples           : liste de canonicals (affichage sous le titre)
+    NOTE: on dédoublonne proprement pour éviter les collisions.
     """
-    data = json.loads(entites_json)
+    data = json.loads(entities_json_str)
 
-    alias_vers_canonique: Dict[str, str] = {}
-    meta_par_canonique: Dict[str, Dict] = {}
-    tous_alias: List[str] = []
-    noms_principaux: List[str] = []
-    tokens_par_canonique: Dict[str, set] = {}
-
-    def tokeniser(s: str) -> List[str]:
-        # mots alphabétiques (accents inclus), min 2 caractères
-        return re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]{2,}", s or "")
+    alias_to_cano: Dict[str, str] = {}
+    orig_by_lower: Dict[str, str] = {}
+    meta_by_cano: Dict[str, Dict] = {}
+    all_aliases_lower: List[str] = []
+    examples: List[str] = []
 
     for ent in data.get("entities", []):
         cano = (ent.get("canonical") or "").strip()
         if not cano:
             continue
 
-        noms_principaux.append(cano)
-        meta_par_canonique[cano] = {
+        examples.append(cano)
+        meta_by_cano[cano] = {
             "label": ent.get("label") or "LAC",
             "category": ent.get("category"),
             "url": ent.get("url"),
         }
 
-        variantes = [cano] + list(ent.get("aliases", []) or [])
-        tokset = set()
-        for a in variantes:
+        # On GARDE LES ALIASES (case-insensitive)
+        variants = [cano] + list(ent.get("aliases", []) or [])
+        for a in variants:
             a = (a or "").strip()
             if not a:
                 continue
-            tous_alias.append(a)
-            alias_vers_canonique[a.lower()] = cano
-            for t in tokeniser(a):
-                tl = t.lower()
-                if tl not in MOTS_GENERIQUES:
-                    tokset.add(tl)
+            low = a.lower()
+            if low in alias_to_cano:
+                # déjà vu : on ne remplace pas (on garde le premier alias d'origine pour l'affichage)
+                continue
+            alias_to_cano[low] = cano
+            orig_by_lower[low] = a
+            all_aliases_lower.append(low)
 
-        tokens_par_canonique[cano] = tokset
+    # dédoublonnages simples en conservant l'ordre (déjà géré par le "if low in ...")
+    examples = list(dict.fromkeys(examples))
+    return alias_to_cano, orig_by_lower, meta_by_cano, all_aliases_lower, examples
 
-    tous_alias = list(dict.fromkeys(tous_alias))
-    noms_principaux = list(dict.fromkeys(noms_principaux))
-    return alias_vers_canonique, meta_par_canonique, tous_alias, noms_principaux, tokens_par_canonique
-
-# --------------- Sélecteur de scoreur ---------------
-def choisir_scorer(nom_mode: str):
+# ---------------------- Scoring WRatio (case-insensitive) ----------------------
+def score_wratio_ci(query: str,
+                    all_aliases_lower: List[str],
+                    alias_to_cano: Dict[str, str],
+                    orig_by_lower: Dict[str, str]) -> List[Dict]:
     """
-    Mappe le nom du mode vers le scoreur RapidFuzz correspondant.
-    Modes proposés :
-      - 'WRatio' (par défaut)
-      - 'partial_ratio'
-      - 'token_set_ratio'
-      - 'token_sort_ratio'
+    Compare la requête à CHAQUE alias **en minuscules** avec WRatio,
+    puis agrège au niveau 'canonical' en conservant le meilleur alias (affiché avec sa casse d'origine).
+    Sortie triée desc: [{"canonical":..., "meilleur_alias":..., "score":...}, ...]
     """
-    table = {
-        "WRatio": fuzz.WRatio,
-        "partial_ratio": fuzz.partial_ratio,
-        "token_set_ratio": fuzz.token_set_ratio,
-        "token_sort_ratio": fuzz.token_sort_ratio,
-    }
-    return table.get(nom_mode, fuzz.WRatio)
-
-# --------------- Scores bruts ---------------
-def calculer_scores(texte: str,
-                    tous_alias: List[str],
-                    alias_vers_canonique: Dict[str, str],
-                    scorer) -> List[Dict]:
-    """
-    Calcule les scores de similarité entre le texte et CHAQUE alias via le 'scorer' choisi,
-    puis agrège au niveau canonical (garde le meilleur alias par canonical).
-    """
-    if not texte.strip():
-        # Pas de texte : renvoie une ligne par canonical avec score 0
-        meilleurs: Dict[str, Dict] = {}
-        for al in tous_alias:
-            cano = alias_vers_canonique.get(al.lower())
-            if cano and cano not in meilleurs:
-                meilleurs[cano] = {"canonical": cano, "meilleur_alias": al, "score": 0.0}
-        return sorted(meilleurs.values(), key=lambda d: (-d["score"], d["canonical"]))
+    # Cas sans saisie → scores à 0 pour affichage de la table
+    if not query.strip():
+        best: Dict[str, Dict] = {}
+        for al_low in all_aliases_lower:
+            cano = alias_to_cano.get(al_low)
+            if cano and cano not in best:
+                best[cano] = {
+                    "canonical": cano,
+                    "meilleur_alias": orig_by_lower.get(al_low, al_low),
+                    "score": 0.0
+                }
+        return sorted(best.values(), key=lambda d: (-d["score"], d["canonical"]))
 
     if not RAPIDFUZZ_OK:
         st.warning("RapidFuzz n'est pas installé : scores à 0.")
-        meilleurs: Dict[str, Dict] = {}
-        for al in tous_alias:
-            cano = alias_vers_canonique.get(al.lower())
-            if cano and cano not in meilleurs:
-                meilleurs[cano] = {"canonical": cano, "meilleur_alias": al, "score": 0.0}
-        return sorted(meilleurs.values(), key=lambda d: (-d["score"], d["canonical"]))
+        best: Dict[str, Dict] = {}
+        for al_low in all_aliases_lower:
+            cano = alias_to_cano.get(al_low)
+            if cano and cano not in best:
+                best[cano] = {
+                    "canonical": cano,
+                    "meilleur_alias": orig_by_lower.get(al_low, al_low),
+                    "score": 0.0
+                }
+        return sorted(best.values(), key=lambda d: (-d["score"], d["canonical"]))
 
-    resultats = process.extract(texte, tous_alias, scorer=scorer, limit=len(tous_alias))
+    # IMPORTANT : on met aussi la requête en minuscules
+    q_low = query.lower()
 
-    meilleurs: Dict[str, Dict] = {}
-    for alias, score, _ in resultats:
-        cano = alias_vers_canonique.get(alias.lower())
+    # Scores par alias_lower (tel quel, pas d’autre normalisation)
+    results = process.extract(q_low, all_aliases_lower, scorer=fuzz.WRatio, limit=len(all_aliases_lower))
+
+    # Agrégation alias -> canonical : on garde le meilleur alias par canonical
+    best: Dict[str, Dict] = {}
+    for alias_low, score, _ in results:
+        cano = alias_to_cano.get(alias_low)
         if not cano:
             continue
-        cur = meilleurs.get(cano)
+        cur = best.get(cano)
         if cur is None or score > cur["score"]:
-            meilleurs[cano] = {"canonical": cano, "meilleur_alias": alias, "score": float(score)}
+            best[cano] = {
+                "canonical": cano,
+                "meilleur_alias": orig_by_lower.get(alias_low, alias_low),  # alias d'origine pour l'affichage
+                "score": float(score)
+            }
 
-    return sorted(meilleurs.values(), key=lambda d: (-d["score"], d["canonical"]))
+    return sorted(best.values(), key=lambda d: (-d["score"], d["canonical"]))
 
-# --------------- Toponymes (mots distinctifs) ---------------
-def extraire_toponymes_par_modele(tokens_par_canonique: Dict[str, set]) -> Dict[str, set]:
+# ---------------------- Réponse (seuil unique) ----------------------
+def build_reply(scores: List[Dict],
+                meta_by_cano: Dict[str, Dict],
+                threshold: float) -> str:
     """
-    Reçoit le set de tokens (canonical+aliases) par modèle, déjà filtré des mots génériques.
-    Retourne tel quel : {canonical: {bethmale, lers, milouga, ...}}
+    Logique binaire (seuil unique WRatio) :
+      - top >= seuil → affirmation
+      - top <  seuil → suggestion prudente
     """
-    return tokens_par_canonique
-
-def appliquer_boost_toponymes(texte: str,
-                              scores_par_cano: List[Dict],
-                              toponymes_par_modele: Dict[str, set],
-                              boost: float = BOOST_TOPONYME) -> List[Dict]:
-    """
-    Si la requête contient un toponyme complet (mot entier) d’un modèle, +boost à ce modèle.
-    """
-    if not texte or not scores_par_cano:
-        return scores_par_cano
-
-    low = texte.lower()
-    for row in scores_par_cano:
-        cano = row["canonical"]
-        mots = toponymes_par_modele.get(cano, set())
-        if not mots:
-            continue
-        if any(re.search(rf"\b{re.escape(m)}\b", low, flags=re.IGNORECASE) for m in mots):
-            row["score"] = min(100.0, float(row["score"]) + float(boost))
-
-    return sorted(scores_par_cano, key=lambda d: (-d["score"], d["canonical"]))
-
-# --------------- Fragments / Préfixes (priorité) ---------------
-def extraire_fragments_utilisateur(texte: str) -> List[str]:
-    """
-    Récupère des fragments 'utiles' tapés par l’utilisateur :
-      - tokens alphabétiques
-      - longueur >= 3 (pour éviter 'de', 'le', 'la' etc.)
-    """
-    return [m.lower() for m in re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]{3,}", texte or "")]
-
-def appliquer_boost_prefixes(texte: str,
-                             scores_par_cano: List[Dict],
-                             tokens_par_canonique: Dict[str, set],
-                             boost: float = BOOST_PREFIXE) -> List[Dict]:
-    """
-    Si l’utilisateur tape un **début** de toponyme (ex. 'beth'), on booste le modèle
-    dont un token commence par ce fragment (mot.startswith(fragment)).
-    → évite que 'beth' parte sur 'Garbet' (suffixe) et favorise 'Bethmale'.
-    """
-    frags = extraire_fragments_utilisateur(texte)
-    if not frags or not scores_par_cano:
-        return scores_par_cano
-
-    for row in scores_par_cano:
-        cano = row["canonical"]
-        toks = tokens_par_canonique.get(cano, set())
-        if not toks:
-            continue
-
-        # Si AU MOINS un token commence par un fragment utilisateur → boost
-        if any(any(tok.startswith(f) for tok in toks) for f in frags):
-            row["score"] = min(100.0, float(row["score"]) + float(boost))
-
-    return sorted(scores_par_cano, key=lambda d: (-d["score"], d["canonical"]))
-
-# --------------- Réponse ---------------
-def construire_reponse(scores: List[Dict],
-                       meta_par_canonique: Dict[str, Dict],
-                       seuil: float) -> str:
     if not scores:
-        return "Je n’ai pas compris votre demande. Donnez le nom exact (ou une variante proche)."
+        return "Je n’ai pas compris votre demande. Donnez le nom exact ou une variante proche."
+
     top = scores[0]
     cano = top["canonical"]
-    url = (meta_par_canonique.get(cano) or {}).get("url")
+    url = (meta_by_cano.get(cano) or {}).get("url")
     sc = float(top["score"])
-    if sc >= float(seuil):
-        msg = f"Je comprends que votre demande concerne « {cano} » (score {sc:.1f})."
+
+    if sc >= float(threshold):
+        msg = f"Je comprends que votre demande concerne « {cano} » (WRatio {sc:.1f})."
         return msg + (f" Fiche : {url}" if url else "")
     else:
         msg = (f"Je ne suis pas certain d'avoir compris votre demande. "
-               f"Peut-être voulez-vous parler de « {cano} » (score {sc:.1f}).")
+               f"Peut-être voulez-vous parler de « {cano} » (WRatio {sc:.1f}).")
         return msg + (f" Fiche : {url}" if url else "")
 
-# =============================================================================
-# UI
-# =============================================================================
-st.title("Couserans — Lacs & Étangs (fuzzy)")
+# ---------------------- UI ----------------------
+st.title("Couserans — Lacs & Étangs (WRatio + aliases, insensible à la casse)")
+st.markdown(
+    """
+**Principe.**  
+Saisie libre → comparaison **WRatio** contre **tous les alias** (comparaison en *minuscules*) →  
+agrégation par **nom canonique** → décision selon un **seuil**.
 
-# Charger JSON + index
-entites_data = lire_json_entites(str(CHEMIN_JSON))
-if not entites_data:
-    st.error(f"Fichier introuvable ou invalide : {CHEMIN_JSON}. Clé 'entities' requise.")
+- *Insensibilité à la casse* : « BETHMALE », « bethmale » ou « Bethmale » donnent les mêmes scores.  
+- *Nom canonique* = forme de référence (ex. « Lac de Bethmale »).  
+- *Alias* = variantes réelles d’écriture (accents, tirets, fautes usuelles…).  
+  Garder des aliases **augmente le rappel** et stabilise les scores.
+"""
+)
+
+data = load_entities(str(JSON_PATH))
+if not data:
+    st.error(f"Fichier introuvable ou invalide : {JSON_PATH} (clé 'entities' requise).")
     st.stop()
 
-entites_json = json.dumps(entites_data, sort_keys=True, ensure_ascii=False)
-alias_vers_canonique, meta_par_canonique, tous_alias, noms_principaux, tokens_par_canonique = \
-    construire_index_depuis_json(entites_json)
+entities_json = json.dumps(data, ensure_ascii=False, sort_keys=True)
+alias_to_cano, orig_by_lower, meta_by_cano, all_aliases_lower, examples = build_index(entities_json)
 
-toponymes_par_modele = extraire_toponymes_par_modele(tokens_par_canonique)
+# Aide : montrer quelques noms de référence à tester
+if examples:
+    st.caption("Exemples : " + " • ".join(examples[:10]))
 
-# Aide sous le titre
-if noms_principaux:
-    st.caption("Exemples : " + " • ".join(noms_principaux[:10]))
-
-# Sidebar : paramètres
-st.sidebar.header("Paramètres")
-mode = st.sidebar.selectbox(
-    "Mode de scoring",
-    options=["WRatio", "partial_ratio", "token_set_ratio", "token_sort_ratio"],
-    index=0,
-    help="Choisis l'algorithme de similarité (comme dans FuzzyWuzzy/RapidFuzz)."
+# Sidebar : un seul réglage
+st.sidebar.header("Paramètre")
+threshold = st.sidebar.slider(
+    "Seuil WRatio",
+    min_value=0, max_value=100, value=80, step=1,
+    help="Au-dessus de ce score, la réponse est affirmative ; sinon elle reste prudente."
 )
-seuil = st.sidebar.slider("Seuil de suggestion", 0, 100, 80, 1)
-boost_prefix = st.sidebar.slider("Boost préfixe (+)", 0, 60, int(BOOST_PREFIXE), 1)
-boost_topo = st.sidebar.slider("Boost toponyme (+)", 0, 60, int(BOOST_TOPONYME), 1)
 
-if st.sidebar.button("Recharger les modèles"):
-    lire_json_entites.clear()
-    construire_index_depuis_json.clear()
-    st.success("Modèles rechargés.")
+if st.sidebar.button("Recharger"):
+    load_entities.clear()
+    build_index.clear()
+    st.success("JSON rechargé depuis le disque.")
 
 # État
-if "historique" not in st.session_state:
-    st.session_state.historique = []
-if "derniers_scores" not in st.session_state:
-    st.session_state.derniers_scores = []
+if "hist" not in st.session_state:
+    st.session_state.hist = []
+if "last_scores" not in st.session_state:
+    st.session_state.last_scores = []
 
 # Formulaire
 with st.form("f"):
-    texte = st.text_input("Votre message", "", help="Ex: 'beth', 'lac bethmale', 'info étang lers'")
+    q = st.text_input("Votre message", "", help="Exemples : 'lac bethmale', 'infos étang lers', 'milouga ?'")
     ok = st.form_submit_button("Envoyer")
 
 if st.button("Vider la conversation"):
-    st.session_state.historique = []
-    st.session_state.derniers_scores = []
+    st.session_state.hist = []
+    st.session_state.last_scores = []
 
 # Traitement
-if ok and texte.strip():
-    scorer = choisir_scorer(mode)
+if ok and q.strip():
+    scores = score_wratio_ci(q, all_aliases_lower, alias_to_cano, orig_by_lower)
+    reply = build_reply(scores, meta_by_cano, threshold)
+    st.session_state.last_scores = scores
+    st.session_state.hist.append({"role": "user", "txt": q})
+    st.session_state.hist.append({"role": "assistant", "txt": reply})
 
-    # 1) scores bruts avec le mode choisi
-    scores = calculer_scores(texte, tous_alias, alias_vers_canonique, scorer)
+# Affichage conversation
+for m in st.session_state.hist:
+    with st.chat_message(m["role"]):
+        st.write(m["txt"])
 
-    # 2) priorité aux fragments/prefixes (corrige 'beth' -> 'Bethmale')
-    scores = appliquer_boost_prefixes(texte, scores, tokens_par_canonique, boost=float(boost_prefix))
-
-    # 3) boost toponymes (mots entiers distinctifs)
-    scores = appliquer_boost_toponymes(texte, scores, toponymes_par_modele, boost=float(boost_topo))
-
-    # 4) réponse
-    reponse = construire_reponse(scores, meta_par_canonique, seuil)
-
-    # historique
-    st.session_state.derniers_scores = scores
-    st.session_state.historique.append({"role": "user", "contenu": texte})
-    st.session_state.historique.append({"role": "assistant", "contenu": reponse})
-
-# Affichage
-for msg in st.session_state.historique:
-    with st.chat_message(msg["role"]):
-        st.write(msg["contenu"])
-
-st.subheader("Scores — Tous les lacs/étangs")
-if st.session_state.derniers_scores:
-    lignes = []
-    for it in st.session_state.derniers_scores:
-        meta = meta_par_canonique.get(it["canonical"], {})
-        lignes.append({
+# Tableau des scores
+st.subheader("Scores WRatio — agrégés par nom canonique (avec alias, insensible à la casse)")
+st.markdown(
+    """
+- **Alias (meilleur)** : la variante (avec casse d’origine) qui a obtenu le score le plus élevé pour ce modèle.  
+- **Score** : WRatio retourné par RapidFuzz (pas de boost, pas d’autre normalisation).  
+"""
+)
+if st.session_state.last_scores:
+    rows = []
+    for it in st.session_state.last_scores:
+        meta = meta_by_cano.get(it["canonical"], {})
+        rows.append({
             "Nom (canonical)": it["canonical"],
             "Alias (meilleur)": it["meilleur_alias"],
             "Score": round(it["score"], 1),
@@ -329,6 +252,7 @@ if st.session_state.derniers_scores:
             "Catégorie": meta.get("category"),
             "URL": meta.get("url"),
         })
-    st.dataframe(lignes, use_container_width=True)
+    rows = sorted(rows, key=lambda r: (-r["Score"], r["Nom (canonical)"]))
+    st.dataframe(rows, use_container_width=True)
 else:
-    st.info("Saisissez un message puis cliquez sur Envoyer.")
+    st.info("Saisissez un message puis cliquez sur Envoyer pour voir les scores.")
