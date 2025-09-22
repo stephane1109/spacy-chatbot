@@ -2,7 +2,8 @@
   "entities": [
     {
       "canonical": "Étang d'Araing",
-      "aliases": ["Etang d'Araing", "Etang d'Arraing", "Araing", "Étang Araing"],
+      "aliases": ["Etang d'Araing", "Etang d'Arraing", "Araing", "Étang Araing", "darraing"],
+      "toponyms": ["araing", "arraing"],
       "label": "LAC",
       "category": "couserans",
       "url": "https://www.tourisme-couserans-pyrenees.com/randonnees/etang-daraing/"
@@ -10,13 +11,15 @@
     {
       "canonical": "Lac de Bethmale",
       "aliases": ["Bethmale", "Lac Bethmale", "Lac de Bethmalé", "Lake Bethmale"],
+      "toponyms": ["bethmale"],
       "label": "LAC",
       "category": "couserans",
       "url": "https://www.tourisme-couserans-pyrenees.com/randonnees/ayet-lac-de-bethmale-en-hiver/"
     },
     {
       "canonical": "Étang de Lers",
-      "aliases": ["Etang de Lers", "Lac de Lers", "Lers", "l'hers", "hers", "Hers"],
+      "aliases": ["Etang de Lers", "Lac de Lers", "Lers", "l'hers", "Lhers", "Hers"],
+      "toponyms": ["lers", "hers"],
       "label": "LAC",
       "category": "couserans",
       "url": "https://www.tourisme-couserans-pyrenees.com/patrimoine-naturel/etang-de-lers/"
@@ -24,6 +27,7 @@
     {
       "canonical": "Étang d'Ayès",
       "aliases": ["Etang d'Ayès", "Etang d'Ayes", "Ayès", "Ayes"],
+      "toponyms": ["ayes", "ayès"],
       "label": "LAC",
       "category": "couserans",
       "url": "https://www.tourisme-couserans-pyrenees.com/equipement/etang-dayes/"
@@ -31,13 +35,15 @@
     {
       "canonical": "Étang d'Eychelle",
       "aliases": ["Etang d'Eychelle", "Etang d'Echelle", "Eychelle"],
+      "toponyms": ["eychelle", "echelle"],
       "label": "LAC",
       "category": "couserans",
       "url": "https://www.tourisme-couserans-pyrenees.com/equipement/etang-deychelle/"
     },
     {
       "canonical": "Étang du Garbet",
-      "aliases": ["Etang du Garbet", "Garbet"],
+      "aliases": ["Etang du Garbet", "Garbet", "Gerbé", "garbet", "etang garbet", "étang garbé", "garbe"],
+      "toponyms": ["garbet"],
       "label": "LAC",
       "category": "couserans",
       "url": "https://www.tourisme-couserans-pyrenees.com/randonnees/etang-du-garbet/"
@@ -45,6 +51,7 @@
     {
       "canonical": "Étang Rond",
       "aliases": ["Etang Rond", "L'étang Rond", "Etang le Rond"],
+      "toponyms": ["rond"],
       "label": "LAC",
       "category": "couserans",
       "url": "https://www.tourisme-couserans-pyrenees.com/equipement/circuits-de-letangs-rond-et-long/"
@@ -52,6 +59,7 @@
     {
       "canonical": "Étang Long",
       "aliases": ["Etang Long", "L'étang Long", "Etang le Long"],
+      "toponyms": ["long"],
       "label": "LAC",
       "category": "couserans",
       "url": "https://www.tourisme-couserans-pyrenees.com/equipement/circuits-de-letangs-rond-et-long/"
@@ -59,6 +67,7 @@
     {
       "canonical": "Étang d'Uls",
       "aliases": ["Etang d'Uls", "Uls"],
+      "toponyms": ["uls"],
       "label": "LAC",
       "category": "couserans",
       "url": "https://www.tourisme-couserans-pyrenees.com/wp-content/uploads/2021/07/Rando-castillon-2021-web.pdf"
@@ -66,6 +75,7 @@
     {
       "canonical": "Étang de Milouga",
       "aliases": ["Etang de Milouga", "Milouga"],
+      "toponyms": ["milouga"],
       "label": "LAC",
       "category": "couserans",
       "url": "https://www.tourisme-couserans-pyrenees.com/wp-content/uploads/2020/03/rando-Generale-2023.pdf"
