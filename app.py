@@ -1,28 +1,54 @@
 from __future__ import annotations
 from pathlib import Path
-from typing import List, Dict
-import json
+from typing import List, Dict, Set
+import json, re, unicodedata
 import streamlit as st
 
-# RapidFuzz = moteur de similarité (équivalent FuzzyWuzzy) : on n'utilise que WRatio
+# =================== RapidFuzz (WRatio) ===================
 try:
     from rapidfuzz import process, fuzz  # type: ignore
     RAPIDFUZZ_OK = True
 except Exception:
     RAPIDFUZZ_OK = False
 
-# ---------------------- Config ----------------------
-st.set_page_config(page_title="Couserans • Lacs & Étangs (WRatio + aliases, insensible à la casse)")  # pas de wide
+# =================== Config ===================
+st.set_page_config(page_title="Couserans • Lacs & Étangs (WRatio + garde-fou + tri focus)")  # pas de wide
 ROOT = Path(__file__).parent
 JSON_PATH = ROOT / "data" / "models_couserans.json"
 
-# ---------------------- Chargement JSON (caché) ----------------------
+# Mots très génériques (pour ignorer les tokens sans valeur sémantique)
+GENERIC = {"lac","lacs","etang","étang","etangs","étangs","de","du","des","la","le","les","l","d","sur","aux","au"}
+
+# =================== Normalisation ===================
+def normaliser(s: str) -> str:
+    """Minuscule, sans accents, petite ponctuation → espace, espaces compactés."""
+    if not s:
+        return ""
+    s = s.lower()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = re.sub(r"[-_’'.,/()]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def tokens_alpha(s: str, minlen: int = 3) -> List[str]:
+    """Extrait des tokens alphabétiques (>= minlen)."""
+    return re.findall(r"[a-zà-öø-ÿ]{%d,}" % minlen, s or "")
+
+def retirer_generiques(s: str) -> str:
+    """
+    Version 'focus' d'un texte : normalise puis retire les mots génériques.
+    Sert uniquement à départager les ex æquo (le score WRatio affiché ne change pas).
+    """
+    n = normaliser(s)
+    if not n:
+        return ""
+    toks = [t for t in n.split() if t not in GENERIC]
+    return " ".join(toks)
+
+# =================== JSON ===================
 @st.cache_resource(show_spinner=False)
-def load_entities(path_str: str) -> dict | None:
-    """
-    Lit le JSON des lacs/étangs.
-    Format attendu: {"entities":[{"canonical":..., "aliases":[...], "label":..., "category":..., "url":...}, ...]}
-    """
+def charger_json(path_str: str) -> dict | None:
     p = Path(path_str)
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
@@ -33,23 +59,31 @@ def load_entities(path_str: str) -> dict | None:
     return None
 
 @st.cache_resource(show_spinner=False)
-def build_index(entities_json_str: str):
+def construire_index(entites_json_str: str):
     """
-    Construit les structures pour le matching (case-insensitive) :
-      - alias_to_cano      : alias_lower -> canonical
-      - orig_by_lower      : alias_lower -> alias tel qu'il apparaît (pour l'affichage)
+    Construit et retourne :
+      - alias_norm_to_cano : alias_normalisé -> canonical
+      - orig_by_norm       : alias_normalisé -> alias original (affichage)
       - meta_by_cano       : {canonical: {label, category, url}}
-      - all_aliases_lower  : liste plate des alias en minuscules (corpus de recherche)
-      - examples           : liste de canonicals (affichage sous le titre)
-    NOTE: on dédoublonne proprement pour éviter les collisions.
+      - all_aliases_norm   : liste des aliases normalisés (corpus WRatio)
+      - examples           : liste des canoniques (pour l’aide)
+      - canonicals_norm    : set(canonical normalisé)
+      - aliases_norm_set   : set(alias normalisé)
+      - toponyms_norm_set  : set(tous toponymes normalisés) → GARDE-FOU UNIQUEMENT
+      - alias_focus_by_norm: alias_normalisé -> alias 'focus' (sans mots génériques) → TRI SECONDAIRE
     """
-    data = json.loads(entities_json_str)
+    data = json.loads(entites_json_str)
 
-    alias_to_cano: Dict[str, str] = {}
-    orig_by_lower: Dict[str, str] = {}
+    alias_norm_to_cano: Dict[str, str] = {}
+    orig_by_norm: Dict[str, str] = {}
     meta_by_cano: Dict[str, Dict] = {}
-    all_aliases_lower: List[str] = []
+    all_aliases_norm: List[str] = []
     examples: List[str] = []
+
+    canonicals_norm: Set[str] = set()
+    aliases_norm_set: Set[str] = set()
+    toponyms_norm_set: Set[str] = set()
+    alias_focus_by_norm: Dict[str, str] = {}
 
     for ent in data.get("entities", []):
         cano = (ent.get("canonical") or "").strip()
@@ -62,91 +96,142 @@ def build_index(entities_json_str: str):
             "category": ent.get("category"),
             "url": ent.get("url"),
         }
+        cn = normaliser(cano)
+        if cn:
+            canonicals_norm.add(cn)
 
-        # On GARDE LES ALIASES (case-insensitive)
+        # Aliases (normalisés) → corpus WRatio + version 'focus' (tri)
         variants = [cano] + list(ent.get("aliases", []) or [])
         for a in variants:
             a = (a or "").strip()
             if not a:
                 continue
-            low = a.lower()
-            if low in alias_to_cano:
-                # déjà vu : on ne remplace pas (on garde le premier alias d'origine pour l'affichage)
+            an = normaliser(a)
+            if not an:
                 continue
-            alias_to_cano[low] = cano
-            orig_by_lower[low] = a
-            all_aliases_lower.append(low)
+            if an in alias_norm_to_cano:
+                continue
+            alias_norm_to_cano[an] = cano
+            orig_by_norm[an] = a
+            all_aliases_norm.append(an)
+            aliases_norm_set.add(an)
+            alias_focus_by_norm[an] = retirer_generiques(a)
 
-    # dédoublonnages simples en conservant l'ordre (déjà géré par le "if low in ...")
+        # Toponymes (normalisés) → GARDE-FOU UNIQUEMENT (pas de scoring)
+        for t in (ent.get("toponyms") or []):
+            t = (t or "").strip()
+            if not t:
+                continue
+            tn = normaliser(t)
+            if tn and tn not in GENERIC:
+                toponyms_norm_set.add(tn)
+
     examples = list(dict.fromkeys(examples))
-    return alias_to_cano, orig_by_lower, meta_by_cano, all_aliases_lower, examples
+    return (
+        alias_norm_to_cano,
+        orig_by_norm,
+        meta_by_cano,
+        all_aliases_norm,
+        examples,
+        canonicals_norm,
+        aliases_norm_set,
+        toponyms_norm_set,
+        alias_focus_by_norm,
+    )
 
-# ---------------------- Scoring WRatio (case-insensitive) ----------------------
-def score_wratio_ci(query: str,
-                    all_aliases_lower: List[str],
-                    alias_to_cano: Dict[str, str],
-                    orig_by_lower: Dict[str, str]) -> List[Dict]:
+# =================== Garde-fou : y a-t-il un signal JSON ? ===================
+def a_un_signal_json(query: str,
+                     canonicals_norm: Set[str],
+                     aliases_norm_set: Set[str],
+                     toponyms_norm_set: Set[str]) -> bool:
     """
-    Compare la requête à CHAQUE alias **en minuscules** avec WRatio,
-    puis agrège au niveau 'canonical' en conservant le meilleur alias (affiché avec sa casse d'origine).
-    Sortie triée desc: [{"canonical":..., "meilleur_alias":..., "score":...}, ...]
+    True si la requête (normalisée) contient :
+      - un canonical normalisé, OU
+      - un alias normalisé, OU
+      - un indice toponymique (préfixe strict/souple) → garde-fou seulement
+    Sinon False.
     """
-    # Cas sans saisie → scores à 0 pour affichage de la table
-    if not query.strip():
+    qn = normaliser(query)
+    if not qn:
+        return False
+
+    if any(cn in qn for cn in canonicals_norm):
+        return True
+    if any(al in qn for al in aliases_norm_set):
+        return True
+
+    # Indices toponymiques (sans modifier les scores)
+    toks = [t for t in tokens_alpha(qn, 3) if t not in GENERIC]
+    if not toks:
+        return False
+    for qt in toks:
+        if any(tp.startswith(qt) for tp in toponyms_norm_set):
+            return True
+        if len(qt) >= 4 and any(tp.startswith(qt[:-1]) for tp in toponyms_norm_set):
+            return True
+    return False
+
+# =================== Scoring WRatio (agrégé par canonical) + tri secondaire ===================
+def scorer_wratio(query: str,
+                  all_aliases_norm: List[str],
+                  alias_norm_to_cano: Dict[str, str],
+                  orig_by_norm: Dict[str, str],
+                  alias_focus_by_norm: Dict[str, str]) -> List[Dict]:
+    """
+    1) Score principal : WRatio(query_norm, alias_norm) → agrégation par canonical (meilleur alias).
+    2) Tri secondaire : en cas d’égalité de score, on compare la requête 'focus' à l'alias 'focus'
+       pour départager (sans changer le score principal).
+    """
+    # Cas vide / RapidFuzz absent
+    if not query.strip() or not RAPIDFUZZ_OK:
+        if not RAPIDFUZZ_OK:
+            st.warning("RapidFuzz n'est pas installé : scores à 0.")
         best: Dict[str, Dict] = {}
-        for al_low in all_aliases_lower:
-            cano = alias_to_cano.get(al_low)
+        for al in all_aliases_norm:
+            cano = alias_norm_to_cano.get(al)
             if cano and cano not in best:
-                best[cano] = {
-                    "canonical": cano,
-                    "meilleur_alias": orig_by_lower.get(al_low, al_low),
-                    "score": 0.0
-                }
-        return sorted(best.values(), key=lambda d: (-d["score"], d["canonical"]))
+                best[cano] = {"canonical": cano, "meilleur_alias": orig_by_norm.get(al, al), "score": 0.0, "focus_score": 0.0}
+        return sorted(best.values(), key=lambda d: (-d["score"], -d["focus_score"], d["canonical"]))
 
-    if not RAPIDFUZZ_OK:
-        st.warning("RapidFuzz n'est pas installé : scores à 0.")
-        best: Dict[str, Dict] = {}
-        for al_low in all_aliases_lower:
-            cano = alias_to_cano.get(al_low)
-            if cano and cano not in best:
-                best[cano] = {
-                    "canonical": cano,
-                    "meilleur_alias": orig_by_lower.get(al_low, al_low),
-                    "score": 0.0
-                }
-        return sorted(best.values(), key=lambda d: (-d["score"], d["canonical"]))
+    qn = normaliser(query)
+    q_focus = retirer_generiques(query)
 
-    # IMPORTANT : on met aussi la requête en minuscules
-    q_low = query.lower()
+    # Score principal (WRatio) sur alias normalisés
+    results = process.extract(qn, all_aliases_norm, scorer=fuzz.WRatio, limit=len(all_aliases_norm))
 
-    # Scores par alias_lower (tel quel, pas d’autre normalisation)
-    results = process.extract(q_low, all_aliases_lower, scorer=fuzz.WRatio, limit=len(all_aliases_lower))
-
-    # Agrégation alias -> canonical : on garde le meilleur alias par canonical
     best: Dict[str, Dict] = {}
-    for alias_low, score, _ in results:
-        cano = alias_to_cano.get(alias_low)
+    for alias_norm, score, _ in results:
+        cano = alias_norm_to_cano.get(alias_norm)
         if not cano:
             continue
+
+        # score 'focus' pour départager en cas d'égalité de 'score'
+        focus_score = 0.0
+        if q_focus:
+            alias_focus = alias_focus_by_norm.get(alias_norm, alias_norm)
+            if alias_focus:
+                focus_score = float(fuzz.WRatio(q_focus, normaliser(alias_focus)))
+
         cur = best.get(cano)
-        if cur is None or score > cur["score"]:
+        if (cur is None) or (score > cur["score"]) or (score == cur["score"] and focus_score > cur.get("focus_score", -1)):
             best[cano] = {
                 "canonical": cano,
-                "meilleur_alias": orig_by_lower.get(alias_low, alias_low),  # alias d'origine pour l'affichage
-                "score": float(score)
+                "meilleur_alias": orig_by_norm.get(alias_norm, alias_norm),
+                "score": float(score),          # score WRatio affiché
+                "focus_score": focus_score,     # sert uniquement au tri
             }
 
-    return sorted(best.values(), key=lambda d: (-d["score"], d["canonical"]))
+    # Tri : score desc, puis focus_score desc, puis nom
+    return sorted(best.values(), key=lambda d: (-d["score"], -d.get("focus_score", 0.0), d["canonical"]))
 
-# ---------------------- Réponse (seuil unique) ----------------------
-def build_reply(scores: List[Dict],
-                meta_by_cano: Dict[str, Dict],
-                threshold: float) -> str:
+# =================== Réponse (seuil unique) ===================
+def construire_reponse(scores: List[Dict],
+                       meta_by_cano: Dict[str, Dict],
+                       seuil: float) -> str:
     """
-    Logique binaire (seuil unique WRatio) :
-      - top >= seuil → affirmation
-      - top <  seuil → suggestion prudente
+    - Si top score >= seuil → réponse affirmative.
+    - Sinon → réponse prudente.
+    - Si pas de scores (ne devrait pas arriver une fois le garde-fou passé) → message neutre.
     """
     if not scores:
         return "Je n’ai pas compris votre demande. Donnez le nom exact ou une variante proche."
@@ -156,53 +241,84 @@ def build_reply(scores: List[Dict],
     url = (meta_by_cano.get(cano) or {}).get("url")
     sc = float(top["score"])
 
-    if sc >= float(threshold):
-        msg = f"Je comprends que votre demande concerne « {cano} » (WRatio {sc:.1f})."
-        return msg + (f" Fiche : {url}" if url else "")
+    if sc >= float(seuil):
+        txt = f"Je comprends que votre demande concerne « {cano} » (WRatio {sc:.1f})."
+        return txt + (f" Fiche : {url}" if url else "")
     else:
-        msg = (f"Je ne suis pas certain d'avoir compris votre demande. "
+        txt = (f"Je ne suis pas certain d'avoir compris votre demande. "
                f"Peut-être voulez-vous parler de « {cano} » (WRatio {sc:.1f}).")
-        return msg + (f" Fiche : {url}" if url else "")
+        return txt + (f" Fiche : {url}" if url else "")
 
-# ---------------------- UI ----------------------
-st.title("Couserans — Lacs & Étangs (WRatio + aliases, insensible à la casse)")
+# =================== UI ===================
+st.title("Couserans — Lacs & Étangs (WRatio + garde-fou + tri focus)")
 st.markdown(
     """
-**Principe.**  
-Saisie libre → comparaison **WRatio** contre **tous les alias** (comparaison en *minuscules*) →  
-agrégation par **nom canonique** → décision selon un **seuil**.
+**Flux de décision**
 
-- *Insensibilité à la casse* : « BETHMALE », « bethmale » ou « Bethmale » donnent les mêmes scores.  
-- *Nom canonique* = forme de référence (ex. « Lac de Bethmale »).  
-- *Alias* = variantes réelles d’écriture (accents, tirets, fautes usuelles…).  
-  Garder des aliases **augmente le rappel** et stabilise les scores.
+1. **Garde-fou JSON** : si la requête ne contient ni *canonical*, ni *alias*, ni **toponyme** (préfixe/off-by-one),
+   on répond : *« Je n’ai pas compris votre question. »*  
+2. Sinon, on calcule **WRatio** contre **tous les aliases** (normalisés), on agrège par **nom canonique**
+   en gardant le **meilleur alias** et son **score**.  
+3. En cas d’**ex æquo**, un **tri secondaire “focus”** compare la requête et les aliases **sans mots génériques**
+   (étang, du, de, lac, etc.) pour départager **sans changer le score**.  
+4. **Seuil WRatio** :  
+   – *score ≥ seuil* → réponse affirmative ;  
+   – *score < seuil* → suggestion prudente.
 """
 )
 
-data = load_entities(str(JSON_PATH))
+data = charger_json(str(JSON_PATH))
 if not data:
     st.error(f"Fichier introuvable ou invalide : {JSON_PATH} (clé 'entities' requise).")
     st.stop()
 
 entities_json = json.dumps(data, ensure_ascii=False, sort_keys=True)
-alias_to_cano, orig_by_lower, meta_by_cano, all_aliases_lower, examples = build_index(entities_json)
+(alias_norm_to_cano,
+ orig_by_norm,
+ meta_by_cano,
+ all_aliases_norm,
+ examples,
+ canonicals_norm,
+ aliases_norm_set,
+ toponyms_norm_set,
+ alias_focus_by_norm) = construire_index(entities_json)
 
-# Aide : montrer quelques noms de référence à tester
 if examples:
     st.caption("Exemples : " + " • ".join(examples[:10]))
 
-# Sidebar : un seul réglage
-st.sidebar.header("Paramètre")
-threshold = st.sidebar.slider(
-    "Seuil WRatio",
-    min_value=0, max_value=100, value=80, step=1,
-    help="Au-dessus de ce score, la réponse est affirmative ; sinon elle reste prudente."
-)
+# Seuil WRatio (unique)
+if "seuil_wratio" not in st.session_state:
+    st.session_state.seuil_wratio = 80
 
-if st.sidebar.button("Recharger"):
-    load_entities.clear()
-    build_index.clear()
-    st.success("JSON rechargé depuis le disque.")
+st.sidebar.header("Paramètre")
+seuil = st.sidebar.slider(
+    "Seuil WRatio",
+    min_value=0, max_value=100,
+    value=st.session_state.seuil_wratio, step=1,
+    help="Au-dessus de ce score, la réponse est affirmative ; sinon elle reste prudente.",
+    key="slider_seuil_wratio"
+)
+st.session_state.seuil_wratio = seuil
+
+# Rechargement JSON
+if st.sidebar.button("Recharger le JSON"):
+    charger_json.clear()
+    construire_index.clear()
+    data = charger_json(str(JSON_PATH))
+    if data:
+        entities_json = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        (alias_norm_to_cano,
+         orig_by_norm,
+         meta_by_cano,
+         all_aliases_norm,
+         examples,
+         canonicals_norm,
+         aliases_norm_set,
+         toponyms_norm_set,
+         alias_focus_by_norm) = construire_index(entities_json)
+        st.success("JSON rechargé.")
+    else:
+        st.error("Échec du rechargement du JSON.")
 
 # État
 if "hist" not in st.session_state:
@@ -211,8 +327,8 @@ if "last_scores" not in st.session_state:
     st.session_state.last_scores = []
 
 # Formulaire
-with st.form("f"):
-    q = st.text_input("Votre message", "", help="Exemples : 'lac bethmale', 'infos étang lers', 'milouga ?'")
+with st.form("form_chat"):
+    q = st.text_input("Votre message", "", help="Ex : 'etang du garb', 'lac bethmale', 'infos lers'…")
     ok = st.form_submit_button("Envoyer")
 
 if st.button("Vider la conversation"):
@@ -221,11 +337,23 @@ if st.button("Vider la conversation"):
 
 # Traitement
 if ok and q.strip():
-    scores = score_wratio_ci(q, all_aliases_lower, alias_to_cano, orig_by_lower)
-    reply = build_reply(scores, meta_by_cano, threshold)
-    st.session_state.last_scores = scores
-    st.session_state.hist.append({"role": "user", "txt": q})
-    st.session_state.hist.append({"role": "assistant", "txt": reply})
+    # 1) Garde-fou : aucun signal JSON → réponse directe
+    if not a_un_signal_json(q, canonicals_norm, aliases_norm_set, toponyms_norm_set):
+        ex = " • ".join(examples[:6]) if examples else ""
+        reply = ("Je n’ai pas compris votre question. "
+                 "Citez explicitement le nom d’un lac/étang de la liste."
+                 + (f" Exemples : {ex}" if ex else ""))
+        st.session_state.last_scores = []
+        st.session_state.hist.append({"role": "user", "txt": q})
+        st.session_state.hist.append({"role": "assistant", "txt": reply})
+    else:
+        # 2) Matching WRatio (sans boost) + tri secondaire 'focus'
+        scores = scorer_wratio(q, all_aliases_norm, alias_norm_to_cano, orig_by_norm, alias_focus_by_norm)
+        reply = construire_reponse(scores, meta_by_cano, st.session_state.seuil_wratio)
+
+        st.session_state.last_scores = scores
+        st.session_state.hist.append({"role": "user", "txt": q})
+        st.session_state.hist.append({"role": "assistant", "txt": reply})
 
 # Affichage conversation
 for m in st.session_state.hist:
@@ -233,11 +361,12 @@ for m in st.session_state.hist:
         st.write(m["txt"])
 
 # Tableau des scores
-st.subheader("Scores WRatio — agrégés par nom canonique (avec alias, insensible à la casse)")
+st.subheader("Scores — meilleurs par nom canonique (WRatio sur aliases)")
 st.markdown(
     """
-- **Alias (meilleur)** : la variante (avec casse d’origine) qui a obtenu le score le plus élevé pour ce modèle.  
-- **Score** : WRatio retourné par RapidFuzz (pas de boost, pas d’autre normalisation).  
+- **Alias (meilleur)** : la variante d’origine qui obtient le meilleur score WRatio.  
+- **Score** : WRatio (sans boost de toponymes).  
+- En cas d’ex æquo, l’ordre affiché est départagé par le **score focus** (requête/alias sans mots génériques).
 """
 )
 if st.session_state.last_scores:
