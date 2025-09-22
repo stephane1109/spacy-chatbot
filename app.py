@@ -12,11 +12,11 @@ except Exception:
     RAPIDFUZZ_OK = False
 
 # =================== Config ===================
-st.set_page_config(page_title="Couserans • Lacs & Étangs (WRatio + garde-fou + tri focus)")  # pas de wide
+st.set_page_config(page_title="Couserans * ChatBot * RapidFuzz")  # pas de wide
 ROOT = Path(__file__).parent
 JSON_PATH = ROOT / "data" / "models_couserans.json"
 
-# Mots très génériques (pour ignorer les tokens sans valeur sémantique)
+# Mots très génériques (pour ignorer les tokens sans valeur sémantique et départager les ex-aequo)
 GENERIC = {"lac","lacs","etang","étang","etangs","étangs","de","du","des","la","le","les","l","d","sur","aux","au"}
 
 # =================== Normalisation ===================
@@ -250,21 +250,21 @@ def construire_reponse(scores: List[Dict],
         return txt + (f" Fiche : {url}" if url else "")
 
 # =================== UI ===================
-st.title("Couserans — Lacs & Étangs (WRatio + garde-fou + tri focus)")
+st.title("Couserans — ChatBot - RapidFuzz  (WRatio + garde-fou + tri focus)")
 st.markdown(
     """
 **Flux de décision**
 
-1. **Garde-fou JSON** : si la requête ne contient ni *canonical*, ni *alias*, ni **toponyme** (préfixe/off-by-one),
-   on répond : *« Je n’ai pas compris votre question. »*  
-2. Sinon, on calcule **WRatio** contre **tous les aliases** (normalisés), on agrège par **nom canonique**
-   en gardant le **meilleur alias** et son **score**.  
-3. En cas d’**ex æquo**, un **tri secondaire “focus”** compare la requête et les aliases **sans mots génériques**
-   (étang, du, de, lac, etc.) pour départager **sans changer le score**.  
-4. **Seuil WRatio** :  
-   – *score ≥ seuil* → réponse affirmative ;  
-   – *score < seuil* → suggestion prudente.
-"""
+1. On calcule **WRatio** contre **tous les aliases** (normalisés), et on match le **meilleur alias** et son **score**.   
+
+2. **Seuil WRatio**  
+   - *score ≥ seuil* → **réponse affirmative**  
+   - *score < seuil* → **suggestion prudente**  
+   - **Garde-fou** : si la requête ne contient ni *nom canonique*, ni *alias*, ni **toponyme**, on répond : *« Je n’ai pas compris votre question. »*
+
+3. **Ex æquo**  
+   En cas d’égalité de score, un **tri secondaire “focus”** compare la requête et les aliases **sans mots génériques** pour départager **sans modifier le score principal**.
+    """
 )
 
 data = charger_json(str(JSON_PATH))
