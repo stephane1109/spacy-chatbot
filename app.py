@@ -37,7 +37,7 @@ def tokens_alpha(s: str, minlen: int = 3) -> List[str]:
 
 def retirer_generiques(s: str) -> str:
     """
-    Version 'focus' d'un texte : normalise puis retire les mots génériques.
+    Version 'différenciateur' d'un texte : normalise puis retire les mots génériques.
     Sert uniquement à départager les ex æquo (le score WRatio affiché ne change pas).
     """
     n = normaliser(s)
@@ -139,7 +139,7 @@ def construire_index(entites_json_str: str):
         alias_focus_by_norm,
     )
 
-# =================== Garde-fou : y a-t-il un signal JSON ? ===================
+# =================== Garde-fou ===================
 def a_un_signal_json(query: str,
                      canonicals_norm: Set[str],
                      aliases_norm_set: Set[str],
@@ -250,7 +250,7 @@ def construire_reponse(scores: List[Dict],
         return txt + (f" Fiche : {url}" if url else "")
 
 # =================== UI ===================
-st.title("Couserans — ChatBot - RapidFuzz  (WRatio + garde-fou + tri focus)")
+st.title("Couserans — ChatBot - RapidFuzz  (WRatio + garde-fou + tri différenciateur)")
 st.markdown(
     """
 **Flux de décision**
@@ -263,7 +263,7 @@ st.markdown(
    - **Garde-fou** : si la requête ne contient ni *nom canonique*, ni *alias*, ni **toponyme**, on répond : *« Je n’ai pas compris votre question. »*
 
 3. **Ex æquo**  
-   En cas d’égalité de score, un **tri secondaire “focus”** compare la requête et les aliases **sans mots génériques** pour départager **sans modifier le score principal**.
+   En cas d’égalité de score, un **tri secondaire “différenciateur”** compare la requête et les aliases **sans mots génériques** pour départager **sans modifier le score principal**.
     """
 )
 
@@ -361,12 +361,12 @@ for m in st.session_state.hist:
         st.write(m["txt"])
 
 # Tableau des scores
-st.subheader("Scores — meilleurs par nom canonique (WRatio sur aliases)")
+st.subheader("Scores — (WRatio sur aliases)")
 st.markdown(
     """
-- **Alias (meilleur)** : la variante d’origine qui obtient le meilleur score WRatio.  
-- **Score** : WRatio (sans boost de toponymes).  
-- En cas d’ex æquo, l’ordre affiché est départagé par le **score focus** (requête/alias sans mots génériques).
+- **Alias (meilleur)** : la variante du nom canonique qui obtient le meilleur score WRatio.  
+- **Score** : WRatio.  
+- En cas d’ex æquo, l’ordre affiché est départagé par le **score différenciateur** (requête/alias sans mots génériques).
 """
 )
 if st.session_state.last_scores:
